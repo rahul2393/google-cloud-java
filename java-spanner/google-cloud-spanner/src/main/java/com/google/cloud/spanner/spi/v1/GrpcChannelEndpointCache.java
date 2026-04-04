@@ -33,6 +33,9 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.annotation.Nullable;
 
 /**
  * gRPC implementation of {@link ChannelEndpointCache}.
@@ -43,6 +46,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 @InternalApi
 class GrpcChannelEndpointCache implements ChannelEndpointCache {
+
+  private static final Logger logger = Logger.getLogger(GrpcChannelEndpointCache.class.getName());
 
   /** Timeout for graceful channel shutdown. */
   private static final long SHUTDOWN_TIMEOUT_SECONDS = 5;
@@ -88,12 +93,22 @@ class GrpcChannelEndpointCache implements ChannelEndpointCache {
             // Create a new provider with the same config but different endpoint.
             // This is thread-safe as withEndpoint() returns a new provider instance.
             TransportChannelProvider newProvider = createProviderWithAuthorityOverride(addr);
-            return new GrpcChannelEndpoint(addr, newProvider);
+            GrpcChannelEndpoint endpoint = new GrpcChannelEndpoint(addr, newProvider);
+            logger.log(Level.INFO, "Location-aware endpoint created for address: {0}", addr);
+            return endpoint;
           } catch (IOException e) {
+            logger.log(
+                Level.WARNING, "Failed to create location-aware endpoint for address: " + addr, e);
             throw SpannerExceptionFactory.newSpannerException(
                 ErrorCode.INTERNAL, "Failed to create channel for address: " + addr, e);
           }
         });
+  }
+
+  @Override
+  @Nullable
+  public ChannelEndpoint getIfPresent(String address) {
+    return servers.get(address);
   }
 
   private TransportChannelProvider createProviderWithAuthorityOverride(String address) {
@@ -210,13 +225,38 @@ class GrpcChannelEndpointCache implements ChannelEndpointCache {
         return false;
       }
       // Check connectivity state without triggering a connection attempt.
+      // Only READY channels are considered healthy for location-aware routing.
       // Some channel implementations don't support getState(), in which case
-      // we assume the channel is healthy if it's not shutdown/terminated.
+      // we treat the endpoint as not ready for location-aware routing (defensive).
       try {
         ConnectivityState state = channel.getState(false);
-        return state != ConnectivityState.SHUTDOWN && state != ConnectivityState.TRANSIENT_FAILURE;
-      } catch (UnsupportedOperationException ignore) {
-        return true;
+        boolean ready = state == ConnectivityState.READY;
+        if (!ready) {
+          logger.log(
+              Level.FINE,
+              "Location-aware endpoint {0} is not ready for location-aware routing, state: {1}",
+              new Object[] {address, state});
+        }
+        return ready;
+      } catch (UnsupportedOperationException e) {
+        logger.log(
+            Level.WARNING,
+            "getState(false) unsupported for location-aware endpoint {0}, treating as not ready",
+            address);
+        return false;
+      }
+    }
+
+    @Override
+    public boolean isTransientFailure() {
+      if (channel.isShutdown() || channel.isTerminated()) {
+        return false;
+      }
+      try {
+        ConnectivityState state = channel.getState(false);
+        return state == ConnectivityState.TRANSIENT_FAILURE;
+      } catch (UnsupportedOperationException e) {
+        return false;
       }
     }
 

@@ -22,9 +22,11 @@ import com.google.spanner.v1.CacheUpdate;
 import com.google.spanner.v1.CommitRequest;
 import com.google.spanner.v1.DirectedReadOptions;
 import com.google.spanner.v1.ExecuteSqlRequest;
+import com.google.spanner.v1.Group;
 import com.google.spanner.v1.Mutation;
 import com.google.spanner.v1.ReadRequest;
 import com.google.spanner.v1.RoutingHint;
+import com.google.spanner.v1.Tablet;
 import com.google.spanner.v1.TransactionOptions;
 import com.google.spanner.v1.TransactionSelector;
 import java.util.ArrayList;
@@ -32,6 +34,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
+import javax.annotation.Nullable;
 
 /**
  * Finds a server for a request using location-aware routing metadata.
@@ -44,9 +47,16 @@ public final class ChannelFinder {
   private final AtomicLong databaseId = new AtomicLong();
   private final KeyRecipeCache recipeCache = new KeyRecipeCache();
   private final KeyRangeCache rangeCache;
+  @Nullable private final EndpointLifecycleManager lifecycleManager;
 
   public ChannelFinder(ChannelEndpointCache endpointCache) {
-    this.rangeCache = new KeyRangeCache(Objects.requireNonNull(endpointCache));
+    this(endpointCache, null);
+  }
+
+  public ChannelFinder(
+      ChannelEndpointCache endpointCache, @Nullable EndpointLifecycleManager lifecycleManager) {
+    this.rangeCache = new KeyRangeCache(Objects.requireNonNull(endpointCache), lifecycleManager);
+    this.lifecycleManager = lifecycleManager;
   }
 
   void useDeterministicRandom() {
@@ -67,6 +77,19 @@ public final class ChannelFinder {
         recipeCache.addRecipes(update.getKeyRecipes());
       }
       rangeCache.addRanges(update);
+
+      // Notify the lifecycle manager about server addresses so it can create endpoints
+      // in the background and start probing.
+      if (lifecycleManager != null) {
+        for (Group group : update.getGroupList()) {
+          for (Tablet tablet : group.getTabletsList()) {
+            String addr = tablet.getServerAddress();
+            if (!addr.isEmpty()) {
+              lifecycleManager.ensureEndpointExists(addr);
+            }
+          }
+        }
+      }
     }
   }
 

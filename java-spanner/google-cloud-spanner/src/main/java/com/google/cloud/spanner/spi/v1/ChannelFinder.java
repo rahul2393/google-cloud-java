@@ -34,6 +34,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Predicate;
 import javax.annotation.Nullable;
 
 /**
@@ -43,6 +44,8 @@ import javax.annotation.Nullable;
  */
 @InternalApi
 public final class ChannelFinder {
+  private static final Predicate<String> NO_EXCLUDED_ENDPOINTS = address -> false;
+
   private final Object updateLock = new Object();
   private final AtomicLong databaseId = new AtomicLong();
   private final KeyRecipeCache recipeCache = new KeyRecipeCache();
@@ -94,47 +97,83 @@ public final class ChannelFinder {
   }
 
   public ChannelEndpoint findServer(ReadRequest.Builder reqBuilder) {
-    return findServer(reqBuilder, preferLeader(reqBuilder.getTransaction()));
+    return findServer(reqBuilder, preferLeader(reqBuilder.getTransaction()), NO_EXCLUDED_ENDPOINTS);
+  }
+
+  public ChannelEndpoint findServer(
+      ReadRequest.Builder reqBuilder, Predicate<String> excludedEndpoints) {
+    return findServer(reqBuilder, preferLeader(reqBuilder.getTransaction()), excludedEndpoints);
   }
 
   public ChannelEndpoint findServer(ReadRequest.Builder reqBuilder, boolean preferLeader) {
+    return findServer(reqBuilder, preferLeader, NO_EXCLUDED_ENDPOINTS);
+  }
+
+  public ChannelEndpoint findServer(
+      ReadRequest.Builder reqBuilder, boolean preferLeader, Predicate<String> excludedEndpoints) {
     recipeCache.computeKeys(reqBuilder);
     return fillRoutingHint(
         preferLeader,
         KeyRangeCache.RangeMode.COVERING_SPLIT,
         reqBuilder.getDirectedReadOptions(),
-        reqBuilder.getRoutingHintBuilder());
+        reqBuilder.getRoutingHintBuilder(),
+        excludedEndpoints);
   }
 
   public ChannelEndpoint findServer(ExecuteSqlRequest.Builder reqBuilder) {
-    return findServer(reqBuilder, preferLeader(reqBuilder.getTransaction()));
+    return findServer(reqBuilder, preferLeader(reqBuilder.getTransaction()), NO_EXCLUDED_ENDPOINTS);
+  }
+
+  public ChannelEndpoint findServer(
+      ExecuteSqlRequest.Builder reqBuilder, Predicate<String> excludedEndpoints) {
+    return findServer(reqBuilder, preferLeader(reqBuilder.getTransaction()), excludedEndpoints);
   }
 
   public ChannelEndpoint findServer(ExecuteSqlRequest.Builder reqBuilder, boolean preferLeader) {
+    return findServer(reqBuilder, preferLeader, NO_EXCLUDED_ENDPOINTS);
+  }
+
+  public ChannelEndpoint findServer(
+      ExecuteSqlRequest.Builder reqBuilder,
+      boolean preferLeader,
+      Predicate<String> excludedEndpoints) {
     recipeCache.computeKeys(reqBuilder);
     return fillRoutingHint(
         preferLeader,
         KeyRangeCache.RangeMode.PICK_RANDOM,
         reqBuilder.getDirectedReadOptions(),
-        reqBuilder.getRoutingHintBuilder());
+        reqBuilder.getRoutingHintBuilder(),
+        excludedEndpoints);
   }
 
   public ChannelEndpoint findServer(BeginTransactionRequest.Builder reqBuilder) {
+    return findServer(reqBuilder, NO_EXCLUDED_ENDPOINTS);
+  }
+
+  public ChannelEndpoint findServer(
+      BeginTransactionRequest.Builder reqBuilder, Predicate<String> excludedEndpoints) {
     if (!reqBuilder.hasMutationKey()) {
       return null;
     }
     return routeMutation(
         reqBuilder.getMutationKey(),
         preferLeader(reqBuilder.getOptions()),
-        reqBuilder.getRoutingHintBuilder());
+        reqBuilder.getRoutingHintBuilder(),
+        excludedEndpoints);
   }
 
   public ChannelEndpoint fillRoutingHint(CommitRequest.Builder reqBuilder) {
+    return fillRoutingHint(reqBuilder, NO_EXCLUDED_ENDPOINTS);
+  }
+
+  public ChannelEndpoint fillRoutingHint(
+      CommitRequest.Builder reqBuilder, Predicate<String> excludedEndpoints) {
     Mutation mutation = selectMutationForRouting(reqBuilder.getMutationsList());
     if (mutation == null) {
       return null;
     }
-    return routeMutation(mutation, /* preferLeader= */ true, reqBuilder.getRoutingHintBuilder());
+    return routeMutation(
+        mutation, /* preferLeader= */ true, reqBuilder.getRoutingHintBuilder(), excludedEndpoints);
   }
 
   private static Mutation selectMutationForRouting(List<Mutation> mutations) {
@@ -162,7 +201,10 @@ public final class ChannelFinder {
   }
 
   private ChannelEndpoint routeMutation(
-      Mutation mutation, boolean preferLeader, RoutingHint.Builder hintBuilder) {
+      Mutation mutation,
+      boolean preferLeader,
+      RoutingHint.Builder hintBuilder,
+      Predicate<String> excludedEndpoints) {
     recipeCache.applySchemaGeneration(hintBuilder);
     TargetRange target = recipeCache.mutationToTargetRange(mutation);
     if (target == null) {
@@ -173,20 +215,23 @@ public final class ChannelFinder {
         preferLeader,
         KeyRangeCache.RangeMode.COVERING_SPLIT,
         DirectedReadOptions.getDefaultInstance(),
-        hintBuilder);
+        hintBuilder,
+        excludedEndpoints);
   }
 
   private ChannelEndpoint fillRoutingHint(
       boolean preferLeader,
       KeyRangeCache.RangeMode rangeMode,
       DirectedReadOptions directedReadOptions,
-      RoutingHint.Builder hintBuilder) {
+      RoutingHint.Builder hintBuilder,
+      Predicate<String> excludedEndpoints) {
     long id = databaseId.get();
     if (id == 0) {
       return null;
     }
     hintBuilder.setDatabaseId(id);
-    return rangeCache.fillRoutingHint(preferLeader, rangeMode, directedReadOptions, hintBuilder);
+    return rangeCache.fillRoutingHint(
+        preferLeader, rangeMode, directedReadOptions, hintBuilder, excludedEndpoints);
   }
 
   private static boolean preferLeader(TransactionSelector selector) {

@@ -82,6 +82,54 @@ public class KeyRangeCacheTest {
   }
 
   @Test
+  public void skipsExplicitlyExcludedTablet() {
+    FakeEndpointCache endpointCache = new FakeEndpointCache();
+    KeyRangeCache cache = new KeyRangeCache(endpointCache);
+
+    cache.addRanges(
+        CacheUpdate.newBuilder()
+            .addRange(
+                Range.newBuilder()
+                    .setStartKey(bytes("a"))
+                    .setLimitKey(bytes("z"))
+                    .setGroupUid(5)
+                    .setSplitId(1)
+                    .setGeneration(bytes("1")))
+            .addGroup(
+                Group.newBuilder()
+                    .setGroupUid(5)
+                    .setGeneration(bytes("1"))
+                    .setLeaderIndex(0)
+                    .addTablets(
+                        Tablet.newBuilder()
+                            .setTabletUid(1)
+                            .setServerAddress("server1")
+                            .setIncarnation(bytes("1"))
+                            .setDistance(0))
+                    .addTablets(
+                        Tablet.newBuilder()
+                            .setTabletUid(2)
+                            .setServerAddress("server2")
+                            .setIncarnation(bytes("1"))
+                            .setDistance(0)))
+            .build());
+
+    RoutingHint.Builder hint = RoutingHint.newBuilder().setKey(bytes("a"));
+    ChannelEndpoint server =
+        cache.fillRoutingHint(
+            /* preferLeader= */ true,
+            KeyRangeCache.RangeMode.COVERING_SPLIT,
+            DirectedReadOptions.getDefaultInstance(),
+            hint,
+            "server1"::equals);
+
+    assertNotNull(server);
+    assertEquals("server2", server.getAddress());
+    assertEquals(1, hint.getSkippedTabletUidCount());
+    assertEquals(1L, hint.getSkippedTabletUid(0).getTabletUid());
+  }
+
+  @Test
   public void shrinkToEvictsRanges() {
     FakeEndpointCache endpointCache = new FakeEndpointCache();
     KeyRangeCache cache = new KeyRangeCache(endpointCache);

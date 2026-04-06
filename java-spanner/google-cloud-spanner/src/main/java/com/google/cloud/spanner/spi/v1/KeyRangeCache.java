@@ -37,6 +37,7 @@ import java.util.Objects;
 import java.util.TreeMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Predicate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.IntStream;
@@ -44,6 +45,7 @@ import java.util.stream.IntStream;
 /** Cache for routing information used by location-aware routing. */
 @InternalApi
 public final class KeyRangeCache {
+  private static final Predicate<String> NO_EXCLUDED_ENDPOINTS = address -> false;
 
   private static final Logger logger = Logger.getLogger(KeyRangeCache.class.getName());
 
@@ -114,6 +116,16 @@ public final class KeyRangeCache {
       RangeMode rangeMode,
       DirectedReadOptions directedReadOptions,
       RoutingHint.Builder hintBuilder) {
+    return fillRoutingHint(
+        preferLeader, rangeMode, directedReadOptions, hintBuilder, NO_EXCLUDED_ENDPOINTS);
+  }
+
+  public ChannelEndpoint fillRoutingHint(
+      boolean preferLeader,
+      RangeMode rangeMode,
+      DirectedReadOptions directedReadOptions,
+      RoutingHint.Builder hintBuilder,
+      Predicate<String> excludedEndpoints) {
     ByteString key = hintBuilder.getKey();
     if (key.isEmpty()) {
       return null;
@@ -133,7 +145,8 @@ public final class KeyRangeCache {
     hintBuilder.setKey(targetRange.startKey);
     hintBuilder.setLimitKey(targetRange.limitKey);
 
-    return targetRange.group.fillRoutingHint(preferLeader, directedReadOptions, hintBuilder);
+    return targetRange.group.fillRoutingHint(
+        preferLeader, directedReadOptions, hintBuilder, excludedEndpoints);
   }
 
   public void clear() {
@@ -487,16 +500,17 @@ public final class KeyRangeCache {
      * <p>State-aware skip logic:
      *
      * <ul>
-     *   <li>Server-marked skip or empty address: skip and report in skipped_tablets.
+     *   <li>Server-marked skip, empty address, or excluded endpoint: skip and report in
+     *       skipped_tablets.
      *   <li>Endpoint exists and READY: usable, do not skip.
      *   <li>Endpoint exists and TRANSIENT_FAILURE: skip and report in skipped_tablets.
      *   <li>Endpoint absent, IDLE, CONNECTING, SHUTDOWN, or unsupported: skip silently (no
      *       skipped_tablets).
      * </ul>
      */
-    boolean shouldSkip(RoutingHint.Builder hintBuilder) {
-      // Server-marked skip or no address: always report.
-      if (skip || serverAddress.isEmpty()) {
+    boolean shouldSkip(RoutingHint.Builder hintBuilder, Predicate<String> excludedEndpoints) {
+      // Server-marked skip, no address, or excluded endpoint: always report.
+      if (skip || serverAddress.isEmpty() || excludedEndpoints.test(serverAddress)) {
         addSkippedTablet(hintBuilder);
         return true;
       }
@@ -640,7 +654,8 @@ public final class KeyRangeCache {
     ChannelEndpoint fillRoutingHint(
         boolean preferLeader,
         DirectedReadOptions directedReadOptions,
-        RoutingHint.Builder hintBuilder) {
+        RoutingHint.Builder hintBuilder,
+        Predicate<String> excludedEndpoints) {
       boolean hasDirectedReadOptions =
           directedReadOptions.getReplicasCase()
               != DirectedReadOptions.ReplicasCase.REPLICAS_NOT_SET;
@@ -652,7 +667,11 @@ public final class KeyRangeCache {
       synchronized (this) {
         CachedTablet selected =
             selectTabletLocked(
-                preferLeader, hasDirectedReadOptions, hintBuilder, directedReadOptions);
+                preferLeader,
+                hasDirectedReadOptions,
+                hintBuilder,
+                directedReadOptions,
+                excludedEndpoints);
         if (selected == null) {
           return null;
         }
@@ -664,19 +683,27 @@ public final class KeyRangeCache {
         boolean preferLeader,
         boolean hasDirectedReadOptions,
         RoutingHint.Builder hintBuilder,
-        DirectedReadOptions directedReadOptions) {
+        DirectedReadOptions directedReadOptions,
+        Predicate<String> excludedEndpoints) {
+      boolean checkedLeader = false;
       if (preferLeader
           && !hasDirectedReadOptions
           && hasLeader()
-          && leader().distance <= MAX_LOCAL_REPLICA_DISTANCE
-          && !leader().shouldSkip(hintBuilder)) {
-        return leader();
+          && leader().distance <= MAX_LOCAL_REPLICA_DISTANCE) {
+        checkedLeader = true;
+        if (!leader().shouldSkip(hintBuilder, excludedEndpoints)) {
+          return leader();
+        }
       }
-      for (CachedTablet tablet : tablets) {
+      for (int index = 0; index < tablets.size(); index++) {
+        if (checkedLeader && index == leaderIndex) {
+          continue;
+        }
+        CachedTablet tablet = tablets.get(index);
         if (!tablet.matches(directedReadOptions)) {
           continue;
         }
-        if (tablet.shouldSkip(hintBuilder)) {
+        if (tablet.shouldSkip(hintBuilder, excludedEndpoints)) {
           continue;
         }
         return tablet;

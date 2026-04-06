@@ -17,10 +17,8 @@
 package com.google.cloud.spanner.spi.v1;
 
 import com.google.api.core.InternalApi;
-import com.google.api.gax.grpc.GrpcTransportChannel;
 import com.google.api.gax.grpc.InstantiatingGrpcChannelProvider;
 import com.google.api.gax.grpc.InstantiatingGrpcChannelProvider.Builder;
-import com.google.api.gax.rpc.TransportChannelProvider;
 import com.google.cloud.spanner.ErrorCode;
 import com.google.cloud.spanner.SpannerExceptionFactory;
 import com.google.common.annotations.VisibleForTesting;
@@ -92,7 +90,8 @@ class GrpcChannelEndpointCache implements ChannelEndpointCache {
           try {
             // Create a new provider with the same config but different endpoint.
             // This is thread-safe as withEndpoint() returns a new provider instance.
-            TransportChannelProvider newProvider = createProviderWithAuthorityOverride(addr);
+            InstantiatingGrpcChannelProvider newProvider =
+                createProviderWithAuthorityOverride(addr);
             GrpcChannelEndpoint endpoint = new GrpcChannelEndpoint(addr, newProvider);
             logger.log(Level.INFO, "Location-aware endpoint created for address: {0}", addr);
             return endpoint;
@@ -111,7 +110,7 @@ class GrpcChannelEndpointCache implements ChannelEndpointCache {
     return servers.get(address);
   }
 
-  private TransportChannelProvider createProviderWithAuthorityOverride(String address) {
+  private InstantiatingGrpcChannelProvider createProviderWithAuthorityOverride(String address) {
     InstantiatingGrpcChannelProvider endpointProvider =
         (InstantiatingGrpcChannelProvider) baseProvider.withEndpoint(address);
     if (Objects.equals(defaultAuthority, address)) {
@@ -191,15 +190,19 @@ class GrpcChannelEndpointCache implements ChannelEndpointCache {
      * @param provider the channel provider (must be a gRPC provider)
      * @throws IOException if the channel cannot be created
      */
-    GrpcChannelEndpoint(String address, TransportChannelProvider provider) throws IOException {
+    GrpcChannelEndpoint(String address, InstantiatingGrpcChannelProvider provider)
+        throws IOException {
       this.address = address;
-      TransportChannelProvider readyProvider = provider;
+      // Build a raw ManagedChannel directly instead of going through getTransportChannel(),
+      // which wraps the channel in a ChannelPool that does not support getState().
+      // Location-aware routing needs getState() to check channel connectivity.
+      InstantiatingGrpcChannelProvider readyProvider = provider;
       if (provider.needsHeaders()) {
-        readyProvider = provider.withHeaders(java.util.Collections.emptyMap());
+        readyProvider =
+            (InstantiatingGrpcChannelProvider)
+                provider.withHeaders(java.util.Collections.emptyMap());
       }
-      GrpcTransportChannel transportChannel =
-          (GrpcTransportChannel) readyProvider.getTransportChannel();
-      this.channel = (ManagedChannel) transportChannel.getChannel();
+      this.channel = readyProvider.createDecoratedChannelBuilder().build();
     }
 
     /**

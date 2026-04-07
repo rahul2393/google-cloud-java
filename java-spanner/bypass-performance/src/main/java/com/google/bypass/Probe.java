@@ -22,6 +22,7 @@ public interface Probe {
     STALE_QUERY,
     STALE_READ,
     STRONG_READ,
+    YCSB_FIXED_READ,
     WRITE,
     WRITE_NO_RP;
 

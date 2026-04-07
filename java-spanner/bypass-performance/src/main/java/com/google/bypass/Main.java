@@ -30,12 +30,16 @@ import io.opentelemetry.sdk.trace.SdkTracerProvider;
 import io.opentelemetry.sdk.trace.export.BatchSpanProcessor;
 import io.opentelemetry.sdk.trace.export.SpanExporter;
 import io.opentelemetry.sdk.trace.samplers.Sampler;
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.InetAddress;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.logging.LogManager;
+import java.util.logging.Logger;
 
 /** Probe application to run spanner client with enabled bypass. */
 final class Main {
@@ -53,6 +57,7 @@ final class Main {
       envBool("SPANNER_ENABLE_EXTENDED_TRACING", false);
   private static boolean enableSpannerEndToEndTracing =
       envBool("SPANNER_ENABLE_END_TO_END_TRACING", false);
+  private static boolean enableDebugLogging = envBool("ENABLE_DEBUG_LOGGING", false);
   private static String workload = envStr("PROBE_TYPE", "strong_read");
   private static String endpoint = envStr("ENDPOINT", "").trim();
   private static String telemetryProjectId =
@@ -66,10 +71,15 @@ final class Main {
   private static int payloadSize = envInt("PAYLOAD_SIZE", 1000);
   private static long maxStalenessSeconds = envLong("MAX_STALENESS_SECONDS", 60);
   private static String serviceName = envStr("OTEL_SERVICE_NAME", "irahul-jloadtest");
+  private static String ycsbTable = envNonBlankStr("YCSB_TABLE", "usertable");
+  private static String ycsbUserId = envNonBlankStr("YCSB_USER_ID", "811092608265");
+  private static String ycsbKey = envStr("YCSB_KEY", "");
+  private static int ycsbZeroPadding = envInt("YCSB_ZERO_PADDING", 20);
 
   private static final OpenTelemetrySdk openTelemetrySdk = initializeOpenTelemetry();
   private static final Tracer tracer = openTelemetrySdk.getTracer("jloadtest");
   private static final Meter meter = openTelemetrySdk.getMeter("jloadtest");
+  private static final Logger logger = Logger.getLogger(Main.class.getName());
   private static final LongCounter requestCounter =
       meter
           .counterBuilder("jop_count")
@@ -107,6 +117,7 @@ final class Main {
   }
 
   public static void main(String[] args) throws Exception {
+    configureLogging();
     if (qps <= 0) {
       throw new IllegalArgumentException("QPS must be > 0. Current value: " + qps);
     }
@@ -119,6 +130,7 @@ final class Main {
     System.out.println("Enable Spanner API tracing: " + enableSpannerApiTracing);
     System.out.println("Enable Spanner extended tracing: " + enableSpannerExtendedTracing);
     System.out.println("Enable Spanner end-to-end tracing: " + enableSpannerEndToEndTracing);
+    System.out.println("Enable debug logging: " + enableDebugLogging);
     System.out.println("Workload: " + workload);
     System.out.println("Endpoint: " + (endpoint.isEmpty() ? "<default>" : endpoint));
     System.out.println("OTel project: " + telemetryProjectId);
@@ -127,6 +139,10 @@ final class Main {
     System.out.println("Spanner database: " + spannerDatabaseId);
     System.out.println("Num rows: " + numRows);
     System.out.println("Max staleness (s): " + maxStalenessSeconds);
+    System.out.println("YCSB table: " + ycsbTable);
+    System.out.println("YCSB user id: " + ycsbUserId);
+    System.out.println("YCSB key override: " + (ycsbKey.trim().isEmpty() ? "<none>" : ycsbKey));
+    System.out.println("YCSB zero padding: " + ycsbZeroPadding);
     System.out.println("Service name: " + serviceName);
     System.out.println("------------------------------------------------------------------------");
 
@@ -190,10 +206,27 @@ final class Main {
       case "strong_query" -> new QueryProbe(client, numRows);
       case "stale_query" -> new QueryProbe(client, numRows, maxStalenessSeconds);
       case "multi_use_ro_query" -> new MultiUseReadOnlyQueryProbe(client, numRows);
+      case "ycsb_fixed_read" ->
+          new YcsbFixedReadProbe(client, ycsbTable, ycsbKey, ycsbUserId, ycsbZeroPadding);
       default -> {
         throw new IllegalArgumentException("Unsupported workload: " + workload);
       }
     };
+  }
+
+  private static void configureLogging() throws IOException {
+    if (!enableDebugLogging) {
+      return;
+    }
+    try (InputStream input =
+        Main.class.getClassLoader().getResourceAsStream("logging.properties")) {
+      if (input == null) {
+        throw new IllegalStateException("Missing logging.properties resource on classpath.");
+      }
+      LogManager.getLogManager().readConfiguration(input);
+      logger.info(
+          "Loaded verbose JUL logging configuration from classpath resource logging.properties");
+    }
   }
 
   static void startProbe(Probe probe) {

@@ -1,0 +1,64 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  namespace: spanner-ns
+  name: irahul-ycsb-fixed-read-probe
+spec:
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: irahul-ycsb-fixed-read-probe
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: ycsb-fixed-read-probe
+          image: us-central1-docker.pkg.dev/span-cloud-testing/irahul-images/irahul-client:latest
+          imagePullPolicy: Always
+          command: ["java"]
+          args:
+            - -XX:-TieredCompilation
+            - -XX:CompileThreshold=1000
+            - -jar
+            - /app/main.jar
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "1"
+            limits:
+              memory: "1Gi"
+              cpu: "1"
+          env:
+            - name: PROBE_TYPE
+              value: "ycsb_fixed_read"
+            - name: QPS
+              value: "1"
+            - name: GOOGLE_SPANNER_EXPERIMENTAL_LOCATION_API
+              value: "true"
+            - name: ENDPOINT
+              value: "http://spanner.spanner-ns:15000"
+            - name: ENABLE_DEBUG_LOGGING
+              value: "true"
+            - name: SPANNER_ENABLE_API_TRACING
+              value: "true"
+            - name: SPANNER_ENABLE_EXTENDED_TRACING
+              value: "true"
+            - name: OTEL_PROJECT_ID
+              value: "outbound-flight"
+            - name: OTEL_SERVICE_NAME
+              value: "irahul-ycsb-fixed-read-probe"
+            - name: SPANNER_PROJECT_ID
+              value: "default"
+            - name: SPANNER_INSTANCE_ID
+              value: "default"
+            - name: SPANNER_DATABASE_ID
+              value: "ycsbdb"
+            - name: YCSB_TABLE
+              value: "usertable"
+            - name: YCSB_USER_ID
+              value: "811092608265"
+            - name: YCSB_ZERO_PADDING
+              value: "20"

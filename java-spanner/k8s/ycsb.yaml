@@ -14,8 +14,6 @@ spec:
         app: ycsb-irahul-run
     spec:
       restartPolicy: Never
-      nodeSelector:
-        cloud.google.com/gke-nodepool: ycsb-1
       containers:
         - name: ycsb-irahul-client
           image: us-west1-docker.pkg.dev/outbound-flight/spanner-box/ycsb-client:latest
@@ -40,7 +38,7 @@ spec:
             - -p
             - cloudspanner.dynamicchannelpool.initsize=1
             - -p
-            - recordcount=1024000000000
+            - recordcount=1000000000000
             - -p
             - operationcount=0
             - -p

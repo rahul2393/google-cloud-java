@@ -26,6 +26,7 @@ import com.google.spanner.v1.Group;
 import com.google.spanner.v1.Range;
 import com.google.spanner.v1.RoutingHint;
 import com.google.spanner.v1.Tablet;
+import io.grpc.ConnectivityState;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -555,7 +556,7 @@ public final class KeyRangeCache {
       if (endpoint == null) {
         logger.log(
             Level.FINE,
-            "Tablet {0} at {1}: no endpoint present, skipping silently",
+            "Tablet {0} at {1}: no endpoint present, skipping without skipped_tablet_uid",
             new Object[] {tabletUid, serverAddress});
         if (lifecycleManager != null) {
           lifecycleManager.requestEndpointRecreation(serverAddress);
@@ -572,7 +573,7 @@ public final class KeyRangeCache {
       if (endpoint.isTransientFailure()) {
         logger.log(
             Level.FINE,
-            "Tablet {0} at {1}: endpoint in TRANSIENT_FAILURE, adding to skipped_tablets",
+            "Tablet {0} at {1}: endpoint in TRANSIENT_FAILURE, adding skipped_tablet_uid",
             new Object[] {tabletUid, serverAddress});
         addSkippedTablet(hintBuilder);
         return true;
@@ -581,8 +582,8 @@ public final class KeyRangeCache {
       // IDLE, CONNECTING, SHUTDOWN, or unsupported - skip silently.
       logger.log(
           Level.FINE,
-          "Tablet {0} at {1}: endpoint not ready, skipping silently",
-          new Object[] {tabletUid, serverAddress});
+          "Tablet {0} at {1}: endpoint state={2}, skipping without skipped_tablet_uid",
+          new Object[] {tabletUid, serverAddress, endpointStateForLogs()});
       return true;
     }
 
@@ -612,6 +613,38 @@ public final class KeyRangeCache {
           + distance
           + (skip ? ",skip" : "")
           + ")";
+    }
+
+    private String skipReasonForLogs(Predicate<String> excludedEndpoints) {
+      if (skip) {
+        return "SERVER_MARKED_SKIP";
+      }
+      if (serverAddress.isEmpty()) {
+        return "MISSING_SERVER_ADDRESS";
+      }
+      if (excludedEndpoints.test(serverAddress)) {
+        return "EXCLUDED_ENDPOINT";
+      }
+      if (endpoint == null) {
+        return "NO_ENDPOINT_PRESENT";
+      }
+      if (endpoint.getChannel().isShutdown()) {
+        return "SHUTDOWN";
+      }
+      if (endpoint.isTransientFailure()) {
+        return "TRANSIENT_FAILURE";
+      }
+      if (endpoint.isHealthy()) {
+        return "READY";
+      }
+      return String.valueOf(endpointStateForLogs());
+    }
+
+    private ConnectivityState endpointStateForLogs() {
+      if (endpoint == null) {
+        return null;
+      }
+      return endpoint.getChannel().getState(false);
     }
   }
 
@@ -705,14 +738,30 @@ public final class KeyRangeCache {
         DirectedReadOptions directedReadOptions,
         Predicate<String> excludedEndpoints) {
       boolean checkedLeader = false;
+      CachedTablet skippedLeader = null;
       if (preferLeader
           && !hasDirectedReadOptions
           && hasLeader()
           && leader().distance <= MAX_LOCAL_REPLICA_DISTANCE) {
         checkedLeader = true;
-        if (!leader().shouldSkip(hintBuilder, excludedEndpoints)) {
-          return leader();
+        skippedLeader = leader();
+        int skippedCountBefore = hintBuilder.getSkippedTabletUidCount();
+        if (!skippedLeader.shouldSkip(hintBuilder, excludedEndpoints)) {
+          return skippedLeader;
         }
+        int skippedCountAfter = hintBuilder.getSkippedTabletUidCount();
+        logger.log(
+            Level.FINE,
+            "Leader tablet {0} in group {1} skipped during routing. address={2}, reason={3},"
+                + " skipped_tablet_uid_added={4}, skipped_tablet_uid_count={5}",
+            new Object[] {
+              skippedLeader.tabletUid,
+              groupUid,
+              skippedLeader.serverAddress,
+              skippedLeader.skipReasonForLogs(excludedEndpoints),
+              skippedCountAfter > skippedCountBefore,
+              skippedCountAfter
+            });
       }
       for (int index = 0; index < tablets.size(); index++) {
         if (checkedLeader && index == leaderIndex) {
@@ -725,7 +774,29 @@ public final class KeyRangeCache {
         if (tablet.shouldSkip(hintBuilder, excludedEndpoints)) {
           continue;
         }
+        if (skippedLeader != null) {
+          logger.log(
+              Level.FINE,
+              "Selected tablet {0} in group {1} after leader tablet {2} was skipped."
+                  + " selected_address={3}, skipped_tablet_uid_count={4}",
+              new Object[] {
+                tablet.tabletUid,
+                groupUid,
+                skippedLeader.tabletUid,
+                tablet.serverAddress,
+                hintBuilder.getSkippedTabletUidCount()
+              });
+        }
         return tablet;
+      }
+      if (skippedLeader != null) {
+        logger.log(
+            Level.FINE,
+            "No tablet selected in group {0} after leader tablet {1} was skipped."
+                + " skipped_tablet_uid_count={2}; request will fall back to default endpoint",
+            new Object[] {
+              groupUid, skippedLeader.tabletUid, hintBuilder.getSkippedTabletUidCount()
+            });
       }
       return null;
     }

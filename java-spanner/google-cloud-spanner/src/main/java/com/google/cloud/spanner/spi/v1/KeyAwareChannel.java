@@ -30,6 +30,7 @@ import com.google.spanner.v1.CommitResponse;
 import com.google.spanner.v1.ExecuteSqlRequest;
 import com.google.spanner.v1.PartialResultSet;
 import com.google.spanner.v1.ReadRequest;
+import com.google.spanner.v1.RoutingHint;
 import com.google.spanner.v1.ResultSet;
 import com.google.spanner.v1.RollbackRequest;
 import com.google.spanner.v1.Transaction;
@@ -415,6 +416,53 @@ final class KeyAwareChannel extends ManagedChannel {
             .build());
   }
 
+  private static void logRoutingHintOutcome(
+      MethodDescriptor<?, ?> methodDescriptor,
+      @Nullable ChannelEndpoint endpoint,
+      boolean usedDefaultEndpoint,
+      @Nullable RoutingHint routingHint) {
+    if (!logger.isLoggable(Level.FINE) || routingHint == null) {
+      return;
+    }
+    if (!usedDefaultEndpoint && routingHint.getSkippedTabletUidCount() == 0) {
+      return;
+    }
+    logger.log(
+        Level.FINE,
+        "Location-aware routing outcome for {0}: endpoint={1}, used_default_endpoint={2},"
+            + " database_id={3}, group_uid={4}, split_id={5}, tablet_uid={6},"
+            + " skipped_tablet_uid_count={7}",
+        new Object[] {
+          methodDescriptor.getFullMethodName(),
+          endpoint == null ? "<null>" : endpoint.getAddress(),
+          usedDefaultEndpoint,
+          routingHint.getDatabaseId(),
+          routingHint.getGroupUid(),
+          routingHint.getSplitId(),
+          routingHint.getTabletUid(),
+          routingHint.getSkippedTabletUidCount()
+        });
+  }
+
+  private static void logCacheUpdateReceipt(
+      MethodDescriptor<?, ?> methodDescriptor,
+      @Nullable ChannelEndpoint endpoint,
+      @Nullable RoutingHint routingHint,
+      boolean hasCacheUpdate) {
+    if (!hasCacheUpdate || !logger.isLoggable(Level.FINE)) {
+      return;
+    }
+    logger.log(
+        Level.FINE,
+        "Received cache_update for {0}: endpoint={1}, tablet_uid={2}, skipped_tablet_uid_count={3}",
+        new Object[] {
+          methodDescriptor.getFullMethodName(),
+          endpoint == null ? "<null>" : endpoint.getAddress(),
+          routingHint == null ? 0L : routingHint.getTabletUid(),
+          routingHint == null ? 0 : routingHint.getSkippedTabletUidCount()
+        });
+  }
+
   static final class KeyAwareClientCall<RequestT, ResponseT>
       extends ForwardingClientCall<RequestT, ResponseT> {
     private final KeyAwareChannel parentChannel;
@@ -428,6 +476,7 @@ final class KeyAwareChannel extends ManagedChannel {
     @Nullable private Predicate<String> excludedEndpoints;
     @Nullable private ChannelEndpoint selectedEndpoint;
     @Nullable private ByteString transactionIdToClear;
+    @Nullable private RoutingHint appliedRoutingHint;
     private boolean allowDefaultAffinity;
     private long pendingRequests;
     private boolean pendingHalfClose;
@@ -493,6 +542,7 @@ final class KeyAwareChannel extends ManagedChannel {
         Predicate<String> excludedEndpoints = excludedEndpoints();
         ChannelEndpoint endpoint = null;
         ChannelFinder finder = null;
+        RoutingHint routingHint = null;
 
         if (message instanceof ReadRequest) {
           ReadRequest.Builder reqBuilder = ((ReadRequest) message).toBuilder();
@@ -500,6 +550,7 @@ final class KeyAwareChannel extends ManagedChannel {
           RoutingDecision routing = routeFromRequest(reqBuilder);
           finder = routing.finder;
           endpoint = routing.endpoint;
+          routingHint = routing.routingHint;
           message = (RequestT) reqBuilder.build();
         } else if (message instanceof ExecuteSqlRequest) {
           ExecuteSqlRequest.Builder reqBuilder = ((ExecuteSqlRequest) message).toBuilder();
@@ -507,6 +558,7 @@ final class KeyAwareChannel extends ManagedChannel {
           RoutingDecision routing = routeFromRequest(reqBuilder);
           finder = routing.finder;
           endpoint = routing.endpoint;
+          routingHint = routing.routingHint;
           message = (RequestT) reqBuilder.build();
         } else if (message instanceof BeginTransactionRequest) {
           BeginTransactionRequest.Builder reqBuilder =
@@ -561,6 +613,7 @@ final class KeyAwareChannel extends ManagedChannel {
                   + " key-aware calls.");
         }
 
+        boolean usedDefaultEndpoint = endpoint == null;
         if (endpoint == null) {
           endpoint = parentChannel.endpointCache.defaultChannel();
         }
@@ -569,14 +622,16 @@ final class KeyAwareChannel extends ManagedChannel {
         }
         selectedEndpoint = endpoint;
         this.channelFinder = finder;
+        this.appliedRoutingHint = routingHint;
 
         // Record real traffic for idle eviction tracking.
         parentChannel.onRequestRouted(endpoint);
 
+        logRoutingHintOutcome(methodDescriptor, endpoint, usedDefaultEndpoint, routingHint);
         recordRouteSelectionTrace(
             methodDescriptor,
             endpoint.getAddress(),
-            parentChannel.defaultEndpointAddress.equals(endpoint.getAddress()),
+            usedDefaultEndpoint || parentChannel.defaultEndpointAddress.equals(endpoint.getAddress()),
             finder != null);
         delegate = endpoint.getChannel().newCall(methodDescriptor, callOptions);
         if (pendingMessageCompression != null) {
@@ -745,7 +800,7 @@ final class KeyAwareChannel extends ManagedChannel {
                 : finder.findServer(reqBuilder, excludedEndpoints);
         endpoint = routed;
       }
-      return new RoutingDecision(finder, endpoint);
+      return new RoutingDecision(finder, endpoint, reqBuilder.getRoutingHint());
     }
 
     private RoutingDecision routeFromRequest(ExecuteSqlRequest.Builder reqBuilder) {
@@ -768,17 +823,22 @@ final class KeyAwareChannel extends ManagedChannel {
                 : finder.findServer(reqBuilder, excludedEndpoints);
         endpoint = routed;
       }
-      return new RoutingDecision(finder, endpoint);
+      return new RoutingDecision(finder, endpoint, reqBuilder.getRoutingHint());
     }
   }
 
   private static final class RoutingDecision {
     @Nullable private final ChannelFinder finder;
     @Nullable private final ChannelEndpoint endpoint;
+    @Nullable private final RoutingHint routingHint;
 
-    private RoutingDecision(@Nullable ChannelFinder finder, @Nullable ChannelEndpoint endpoint) {
+    private RoutingDecision(
+        @Nullable ChannelFinder finder,
+        @Nullable ChannelEndpoint endpoint,
+        @Nullable RoutingHint routingHint) {
       this.finder = finder;
       this.endpoint = endpoint;
+      this.routingHint = routingHint;
     }
   }
 
@@ -797,24 +857,44 @@ final class KeyAwareChannel extends ManagedChannel {
       ByteString transactionId = null;
       if (message instanceof PartialResultSet) {
         PartialResultSet response = (PartialResultSet) message;
+        logCacheUpdateReceipt(
+            call.methodDescriptor,
+            call.selectedEndpoint,
+            call.appliedRoutingHint,
+            response.hasCacheUpdate());
         if (response.hasCacheUpdate() && call.channelFinder != null) {
           call.channelFinder.update(response.getCacheUpdate());
         }
         transactionId = transactionIdFromMetadata(response);
       } else if (message instanceof ResultSet) {
         ResultSet response = (ResultSet) message;
+        logCacheUpdateReceipt(
+            call.methodDescriptor,
+            call.selectedEndpoint,
+            call.appliedRoutingHint,
+            response.hasCacheUpdate());
         if (response.hasCacheUpdate() && call.channelFinder != null) {
           call.channelFinder.update(response.getCacheUpdate());
         }
         transactionId = transactionIdFromMetadata(response);
       } else if (message instanceof Transaction) {
         Transaction response = (Transaction) message;
+        logCacheUpdateReceipt(
+            call.methodDescriptor,
+            call.selectedEndpoint,
+            call.appliedRoutingHint,
+            response.hasCacheUpdate());
         if (response.hasCacheUpdate() && call.channelFinder != null) {
           call.channelFinder.update(response.getCacheUpdate());
         }
         transactionId = transactionIdFromTransaction(response);
       } else if (message instanceof CommitResponse) {
         CommitResponse response = (CommitResponse) message;
+        logCacheUpdateReceipt(
+            call.methodDescriptor,
+            call.selectedEndpoint,
+            call.appliedRoutingHint,
+            response.hasCacheUpdate());
         if (response.hasCacheUpdate() && call.channelFinder != null) {
           call.channelFinder.update(response.getCacheUpdate());
         }

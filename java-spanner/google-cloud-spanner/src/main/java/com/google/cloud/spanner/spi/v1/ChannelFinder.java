@@ -30,8 +30,10 @@ import com.google.spanner.v1.Tablet;
 import com.google.spanner.v1.TransactionOptions;
 import com.google.spanner.v1.TransactionSelector;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
@@ -84,14 +86,20 @@ public final class ChannelFinder {
       // Notify the lifecycle manager about server addresses so it can create endpoints
       // in the background and start probing.
       if (lifecycleManager != null) {
+        Set<String> currentAddresses = new HashSet<>();
         for (Group group : update.getGroupList()) {
           for (Tablet tablet : group.getTabletsList()) {
             String addr = tablet.getServerAddress();
             if (!addr.isEmpty()) {
+              currentAddresses.add(addr);
               lifecycleManager.ensureEndpointExists(addr);
             }
           }
         }
+        // Also include addresses from existing cached tablets not in this update.
+        currentAddresses.addAll(rangeCache.getActiveAddresses());
+        // Evict endpoints no longer referenced by any tablet across all finders.
+        lifecycleManager.updateActiveAddresses(this, currentAddresses);
       }
     }
   }

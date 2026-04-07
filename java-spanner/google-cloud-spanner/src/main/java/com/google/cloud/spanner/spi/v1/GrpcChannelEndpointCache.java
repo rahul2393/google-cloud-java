@@ -93,11 +93,11 @@ class GrpcChannelEndpointCache implements ChannelEndpointCache {
             InstantiatingGrpcChannelProvider newProvider =
                 createProviderWithAuthorityOverride(addr);
             GrpcChannelEndpoint endpoint = new GrpcChannelEndpoint(addr, newProvider);
-            logger.log(Level.INFO, "Location-aware endpoint created for address: {0}", addr);
+            logger.log(Level.FINE, "Location-aware endpoint created for address: {0}", addr);
             return endpoint;
           } catch (IOException e) {
             logger.log(
-                Level.WARNING, "Failed to create location-aware endpoint for address: " + addr, e);
+                Level.FINE, "Failed to create location-aware endpoint for address: " + addr, e);
             throw SpannerExceptionFactory.newSpannerException(
                 ErrorCode.INTERNAL, "Failed to create channel for address: " + addr, e);
           }
@@ -243,7 +243,7 @@ class GrpcChannelEndpointCache implements ChannelEndpointCache {
         return ready;
       } catch (UnsupportedOperationException e) {
         logger.log(
-            Level.WARNING,
+            Level.FINE,
             "getState(false) unsupported for location-aware endpoint {0}, treating as not ready",
             address);
         return false;

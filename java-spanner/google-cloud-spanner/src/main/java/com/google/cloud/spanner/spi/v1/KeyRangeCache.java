@@ -30,10 +30,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.Objects;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
@@ -147,6 +149,23 @@ public final class KeyRangeCache {
 
     return targetRange.group.fillRoutingHint(
         preferLeader, directedReadOptions, hintBuilder, excludedEndpoints);
+  }
+
+  /** Returns all server addresses currently referenced by cached tablets. */
+  Set<String> getActiveAddresses() {
+    Set<String> addresses = new HashSet<>();
+    synchronized (lock) {
+      for (CachedGroup group : groups.values()) {
+        synchronized (group) {
+          for (CachedTablet tablet : group.tablets) {
+            if (!tablet.serverAddress.isEmpty()) {
+              addresses.add(tablet.serverAddress);
+            }
+          }
+        }
+      }
+    }
+    return addresses;
   }
 
   public void clear() {
@@ -552,7 +571,7 @@ public final class KeyRangeCache {
       // TRANSIENT_FAILURE - skip and report so server can refresh client cache.
       if (endpoint.isTransientFailure()) {
         logger.log(
-            Level.INFO,
+            Level.FINE,
             "Tablet {0} at {1}: endpoint in TRANSIENT_FAILURE, adding to skipped_tablets",
             new Object[] {tabletUid, serverAddress});
         addSkippedTablet(hintBuilder);

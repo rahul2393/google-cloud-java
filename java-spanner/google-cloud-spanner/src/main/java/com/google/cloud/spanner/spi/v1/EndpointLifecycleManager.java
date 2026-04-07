@@ -18,14 +18,8 @@ package com.google.cloud.spanner.spi.v1;
 
 import com.google.api.core.InternalApi;
 import com.google.common.annotations.VisibleForTesting;
-import com.google.spanner.v1.GetSessionRequest;
-import com.google.spanner.v1.SpannerGrpc;
-import io.grpc.CallOptions;
-import io.grpc.ClientCall;
 import io.grpc.ConnectivityState;
 import io.grpc.ManagedChannel;
-import io.grpc.Metadata;
-import io.grpc.Status;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -49,9 +43,11 @@ import java.util.logging.Logger;
  *
  * <ul>
  *   <li>Creates endpoints in the background when new server addresses appear in cache updates.
- *   <li>Sends periodic {@code GetSession} probes to keep replica channels warm and in READY state.
- *   <li>Tracks real traffic vs probe traffic per endpoint.
- *   <li>Evicts endpoints that have had no real traffic for the configured idle duration.
+ *   <li>Periodically checks channel state and uses {@code getState(true)} to warm up IDLE channels
+ *       without sending application RPCs.
+ *   <li>Tracks real traffic per endpoint.
+ *   <li>Evicts endpoints that have had no real traffic for the configured idle duration, or that
+ *       are in TRANSIENT_FAILURE state.
  *   <li>Recreates and reprobes endpoints when they are needed again after eviction.
  * </ul>
  */
@@ -69,8 +65,11 @@ class EndpointLifecycleManager {
   /** Interval for checking idle eviction: every 5 minutes. */
   private static final long EVICTION_CHECK_INTERVAL_SECONDS = 300;
 
-  /** Timeout for probe RPCs. */
-  private static final long PROBE_TIMEOUT_SECONDS = 10;
+  /**
+   * Maximum consecutive TRANSIENT_FAILURE probes before evicting an endpoint. Gives the channel
+   * time to recover from transient network issues before we tear it down and recreate.
+   */
+  private static final int MAX_TRANSIENT_FAILURE_COUNT = 3;
 
   /** Per-endpoint lifecycle state. */
   static final class EndpointState {
@@ -79,12 +78,14 @@ class EndpointLifecycleManager {
     volatile Instant lastRealTrafficAt;
     volatile Instant lastReadyAt;
     volatile ScheduledFuture<?> probeFuture;
+    volatile int consecutiveTransientFailures;
 
     EndpointState(String address, Instant now) {
       this.address = address;
       this.lastRealTrafficAt = now;
       this.lastProbeAt = null;
       this.lastReadyAt = null;
+      this.consecutiveTransientFailures = 0;
     }
   }
 
@@ -97,7 +98,6 @@ class EndpointLifecycleManager {
   private final Clock clock;
   private final String defaultEndpointAddress;
 
-  private volatile String multiplexedSessionName;
   private ScheduledFuture<?> evictionFuture;
 
   EndpointLifecycleManager(ChannelEndpointCache endpointCache) {
@@ -135,36 +135,6 @@ class EndpointLifecycleManager {
             EVICTION_CHECK_INTERVAL_SECONDS,
             EVICTION_CHECK_INTERVAL_SECONDS,
             TimeUnit.SECONDS);
-  }
-
-  /**
-   * Sets the multiplexed session name used for GetSession probes. All probers reuse the same
-   * session since multiplexed sessions are enabled.
-   *
-   * <p>The session name is updated on every call because the client may rotate multiplexed sessions
-   * over time. Probes must always use the current session to avoid sending GetSession to a stale,
-   * deleted session.
-   */
-  void setMultiplexedSessionName(String sessionName) {
-    if (sessionName == null || sessionName.isEmpty()) {
-      return;
-    }
-    String previous = this.multiplexedSessionName;
-    this.multiplexedSessionName = sessionName;
-    if (previous == null) {
-      logger.log(
-          Level.FINE, "Lifecycle manager captured session name for probing: {0}", sessionName);
-    } else if (!previous.equals(sessionName)) {
-      logger.log(
-          Level.FINE,
-          "Lifecycle manager updated session name for probing: {0} -> {1}",
-          new Object[] {previous, sessionName});
-    }
-  }
-
-  /** Returns the multiplexed session name, or null if not yet captured. */
-  String getMultiplexedSessionName() {
-    return multiplexedSessionName;
   }
 
   /**
@@ -257,7 +227,17 @@ class EndpointLifecycleManager {
     }
   }
 
-  /** Sends a GetSession probe to the endpoint, but only if the channel is not already READY. */
+  /**
+   * Probes the endpoint by checking channel connectivity state and warming up IDLE channels.
+   *
+   * <p>Uses {@code getState(true)} to request a connection attempt on IDLE channels instead of
+   * sending a GetSession RPC. This is lighter weight and avoids routing application-level RPCs
+   * through the endpoint's channel pool.
+   *
+   * <p>If the channel is in TRANSIENT_FAILURE, increments a consecutive failure counter. After
+   * {@link #MAX_TRANSIENT_FAILURE_COUNT} consecutive failures, the endpoint is evicted and shut
+   * down so it can be recreated fresh when needed again.
+   */
   private void probe(String address) {
     if (isShutdown.get()) {
       return;
@@ -274,76 +254,69 @@ class EndpointLifecycleManager {
       return;
     }
 
-    // Check channel state: only probe if the channel is not already READY.
     ManagedChannel channel = endpoint.getChannel();
+    state.lastProbeAt = clock.instant();
+
     try {
+      // getState(false) reads current state without triggering a connection.
       ConnectivityState channelState = channel.getState(false);
-      if (channelState == ConnectivityState.READY) {
-        state.lastReadyAt = clock.instant();
-        logger.log(Level.FINE, "Probe skipped for {0}: channel already READY", address);
-        return;
-      }
       logger.log(
-          Level.FINE,
-          "Channel {0} in state {1}, sending GetSession probe",
-          new Object[] {address, channelState});
+          Level.FINE, "Probe for {0}: channel state is {1}", new Object[] {address, channelState});
+
+      switch (channelState) {
+        case READY:
+          state.lastReadyAt = clock.instant();
+          state.consecutiveTransientFailures = 0;
+          logger.log(Level.FINE, "Probe for {0}: channel READY, no action needed", address);
+          break;
+
+        case IDLE:
+          // Warm up the channel by requesting a connection attempt.
+          logger.log(
+              Level.INFO, "Probe for {0}: channel IDLE, requesting connection (warmup)", address);
+          channel.getState(true);
+          state.consecutiveTransientFailures = 0;
+          break;
+
+        case CONNECTING:
+          logger.log(Level.FINE, "Probe for {0}: channel CONNECTING, waiting", address);
+          state.consecutiveTransientFailures = 0;
+          break;
+
+        case TRANSIENT_FAILURE:
+          state.consecutiveTransientFailures++;
+          logger.log(
+              Level.WARNING,
+              "Probe for {0}: channel in TRANSIENT_FAILURE ({1}/{2})",
+              new Object[] {
+                address, state.consecutiveTransientFailures, MAX_TRANSIENT_FAILURE_COUNT
+              });
+          if (state.consecutiveTransientFailures >= MAX_TRANSIENT_FAILURE_COUNT) {
+            logger.log(
+                Level.WARNING,
+                "Evicting endpoint {0}: {1} consecutive TRANSIENT_FAILURE probes",
+                new Object[] {address, state.consecutiveTransientFailures});
+            evictEndpoint(address);
+          }
+          break;
+
+        case SHUTDOWN:
+          logger.log(Level.WARNING, "Probe for {0}: channel SHUTDOWN, evicting endpoint", address);
+          evictEndpoint(address);
+          break;
+
+        default:
+          logger.log(
+              Level.FINE,
+              "Probe for {0}: unrecognized channel state {1}",
+              new Object[] {address, channelState});
+          break;
+      }
     } catch (UnsupportedOperationException e) {
-      // If getState() is unsupported, fall through and probe.
-    }
-
-    String sessionName = multiplexedSessionName;
-    if (sessionName == null || sessionName.isEmpty()) {
       logger.log(
-          Level.FINE,
-          "Skipping probe for {0}: multiplexed session name not yet available",
+          Level.WARNING,
+          "Probe for {0}: getState() unsupported, cannot determine channel health",
           address);
-      // Even without a session, request a connection to keep the channel from going idle.
-      try {
-        channel.getState(true);
-      } catch (Exception ignored) {
-        // Best effort.
-      }
-      return;
-    }
-
-    GetSessionRequest request = GetSessionRequest.newBuilder().setName(sessionName).build();
-
-    try {
-      ClientCall<GetSessionRequest, com.google.spanner.v1.Session> call =
-          channel.newCall(
-              SpannerGrpc.getGetSessionMethod(),
-              CallOptions.DEFAULT.withDeadlineAfter(PROBE_TIMEOUT_SECONDS, TimeUnit.SECONDS));
-
-      call.start(
-          new ClientCall.Listener<com.google.spanner.v1.Session>() {
-            @Override
-            public void onMessage(com.google.spanner.v1.Session message) {
-              state.lastProbeAt = clock.instant();
-              if (endpoint.isHealthy()) {
-                state.lastReadyAt = clock.instant();
-              }
-              logger.log(Level.FINE, "Probe succeeded for endpoint: {0}", address);
-            }
-
-            @Override
-            public void onClose(Status status, Metadata trailers) {
-              state.lastProbeAt = clock.instant();
-              if (!status.isOk()) {
-                logger.log(
-                    Level.WARNING,
-                    "Probe failed for endpoint {0}: {1}",
-                    new Object[] {address, status});
-              }
-            }
-          },
-          new Metadata());
-
-      call.sendMessage(request);
-      call.halfClose();
-      call.request(1);
-    } catch (Exception e) {
-      state.lastProbeAt = clock.instant();
-      logger.log(Level.WARNING, "Probe exception for endpoint " + address, e);
     }
   }
 

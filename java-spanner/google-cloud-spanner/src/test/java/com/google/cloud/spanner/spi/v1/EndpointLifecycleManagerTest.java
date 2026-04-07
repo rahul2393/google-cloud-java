@@ -204,33 +204,6 @@ public class EndpointLifecycleManagerTest {
   }
 
   @Test
-  public void sessionNameIsUpdatedOnRotation() {
-    KeyRangeCacheTest.FakeEndpointCache cache = new KeyRangeCacheTest.FakeEndpointCache();
-    manager =
-        new EndpointLifecycleManager(
-            cache, /* probeIntervalSeconds= */ 60, Duration.ofMinutes(30), Clock.systemUTC());
-
-    assertNull(manager.getMultiplexedSessionName());
-
-    manager.setMultiplexedSessionName("projects/p/instances/i/databases/d/sessions/s1");
-    assertEquals(
-        "projects/p/instances/i/databases/d/sessions/s1", manager.getMultiplexedSessionName());
-
-    // Session rotation: second set should overwrite so probes use the current session.
-    manager.setMultiplexedSessionName("projects/p/instances/i/databases/d/sessions/s2");
-    assertEquals(
-        "projects/p/instances/i/databases/d/sessions/s2", manager.getMultiplexedSessionName());
-
-    // Null and empty should not clear.
-    manager.setMultiplexedSessionName(null);
-    assertEquals(
-        "projects/p/instances/i/databases/d/sessions/s2", manager.getMultiplexedSessionName());
-    manager.setMultiplexedSessionName("");
-    assertEquals(
-        "projects/p/instances/i/databases/d/sessions/s2", manager.getMultiplexedSessionName());
-  }
-
-  @Test
   public void shutdownStopsAllProbing() throws Exception {
     KeyRangeCacheTest.FakeEndpointCache cache = new KeyRangeCacheTest.FakeEndpointCache();
     manager =

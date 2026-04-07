@@ -158,15 +158,11 @@ final class KeyAwareChannel extends ManagedChannel {
     return finder;
   }
 
-  /** Captures the session name for probe use and records real traffic to the selected endpoint. */
+  /** Records real traffic to the selected endpoint for idle eviction tracking. */
   private void onRequestRouted(
       @Nullable String session, @Nullable ChannelEndpoint selectedEndpoint) {
     if (lifecycleManager == null) {
       return;
-    }
-    // Capture session name for lifecycle manager probes.
-    if (session != null && !session.isEmpty()) {
-      lifecycleManager.setMultiplexedSessionName(session);
     }
     // Record real traffic for idle eviction tracking.
     if (selectedEndpoint != null && !defaultEndpointAddress.equals(selectedEndpoint.getAddress())) {

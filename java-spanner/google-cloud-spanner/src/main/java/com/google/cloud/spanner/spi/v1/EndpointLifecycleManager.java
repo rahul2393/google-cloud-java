@@ -22,6 +22,7 @@ import com.google.spanner.v1.GetSessionRequest;
 import com.google.spanner.v1.SpannerGrpc;
 import io.grpc.CallOptions;
 import io.grpc.ClientCall;
+import io.grpc.ConnectivityState;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.Status;
@@ -256,27 +257,9 @@ class EndpointLifecycleManager {
     }
   }
 
-  /** Sends a GetSession probe to the endpoint. */
+  /** Sends a GetSession probe to the endpoint, but only if the channel is not already READY. */
   private void probe(String address) {
     if (isShutdown.get()) {
-      return;
-    }
-
-    String sessionName = multiplexedSessionName;
-    if (sessionName == null || sessionName.isEmpty()) {
-      logger.log(
-          Level.FINE,
-          "Skipping probe for {0}: multiplexed session name not yet available",
-          address);
-      // Even without a session, request a connection to keep the channel from going idle.
-      ChannelEndpoint endpoint = endpointCache.getIfPresent(address);
-      if (endpoint != null) {
-        try {
-          endpoint.getChannel().getState(true);
-        } catch (Exception ignored) {
-          // Best effort.
-        }
-      }
       return;
     }
 
@@ -291,7 +274,38 @@ class EndpointLifecycleManager {
       return;
     }
 
+    // Check channel state: only probe if the channel is not already READY.
     ManagedChannel channel = endpoint.getChannel();
+    try {
+      ConnectivityState channelState = channel.getState(false);
+      if (channelState == ConnectivityState.READY) {
+        state.lastReadyAt = clock.instant();
+        logger.log(Level.FINE, "Probe skipped for {0}: channel already READY", address);
+        return;
+      }
+      logger.log(
+          Level.FINE,
+          "Channel {0} in state {1}, sending GetSession probe",
+          new Object[] {address, channelState});
+    } catch (UnsupportedOperationException e) {
+      // If getState() is unsupported, fall through and probe.
+    }
+
+    String sessionName = multiplexedSessionName;
+    if (sessionName == null || sessionName.isEmpty()) {
+      logger.log(
+          Level.FINE,
+          "Skipping probe for {0}: multiplexed session name not yet available",
+          address);
+      // Even without a session, request a connection to keep the channel from going idle.
+      try {
+        channel.getState(true);
+      } catch (Exception ignored) {
+        // Best effort.
+      }
+      return;
+    }
+
     GetSessionRequest request = GetSessionRequest.newBuilder().setName(sessionName).build();
 
     try {

@@ -31,7 +31,7 @@ LICENSE file.
 
   <properties>
     <google.cloud.opentelemetry.version>0.36.0</google.cloud.opentelemetry.version>
-    <opentelemetry.version>1.49.0</opentelemetry.version>
+    <opentelemetry.version>1.56.0</opentelemetry.version>
   </properties>
 
   <dependencyManagement>
@@ -92,8 +92,18 @@ LICENSE file.
       <groupId>io.opentelemetry</groupId>
       <artifactId>opentelemetry-sdk</artifactId>
     </dependency>
-
+    <dependency>
+      <groupId>com.google.cloud.opentelemetry</groupId>
+      <artifactId>exporter-trace</artifactId>
+      <version>${google.cloud.opentelemetry.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.opentelemetry</groupId>
+      <artifactId>opentelemetry-sdk-trace</artifactId>
+      <version>${opentelemetry.version}</version>
+    </dependency>
   </dependencies>
+
   <build>
     <plugins>
       <plugin>

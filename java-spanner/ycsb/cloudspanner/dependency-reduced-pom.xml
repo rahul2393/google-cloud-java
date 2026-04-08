@@ -64,6 +64,6 @@
   </dependencyManagement>
   <properties>
     <google.cloud.opentelemetry.version>0.36.0</google.cloud.opentelemetry.version>
-    <opentelemetry.version>1.49.0</opentelemetry.version>
+    <opentelemetry.version>1.56.0</opentelemetry.version>
   </properties>
 </project>

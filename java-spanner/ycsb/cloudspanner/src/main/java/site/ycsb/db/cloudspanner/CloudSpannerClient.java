@@ -34,6 +34,8 @@ import com.google.cloud.spanner.Statement;
 import com.google.cloud.spanner.Struct;
 import com.google.cloud.spanner.StructReader;
 import com.google.cloud.spanner.TimestampBound;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.context.Scope;
 import io.grpc.ManagedChannelBuilder;
 import site.ycsb.ByteIterator;
 import site.ycsb.Client;
@@ -215,6 +217,7 @@ public class CloudSpannerClient extends DB {
     if (project != null) {
       optionsBuilder.setProjectId(project);
     }
+    TracingSupport.configureSpannerOptions(optionsBuilder, properties);
     MetricsSupport.configureSpannerOptions(optionsBuilder, properties);
     if (dynamicChannelPoolEnabled) {
       GcpChannelPoolOptions defaultChannelPoolOptions =
@@ -296,6 +299,7 @@ public class CloudSpannerClient extends DB {
         @Override
         public void run() {
           spanner.close();
+          TracingSupport.shutdown();
           MetricsSupport.shutdown();
         }
       });
@@ -378,6 +382,12 @@ public class CloudSpannerClient extends DB {
           .append(MetricsSupport.getConfiguredMetricPrefix())
           .append("\nOTEL service name: ")
           .append(MetricsSupport.getConfiguredServiceName())
+          .append("\nTracing enabled: ")
+          .append(TracingSupport.isEnabled())
+          .append("\nTracing project: ")
+          .append(TracingSupport.getConfiguredProjectId())
+          .append("\nTracing service name: ")
+          .append(TracingSupport.getConfiguredServiceName())
           .toString());
     }
   }
@@ -415,17 +425,28 @@ public class CloudSpannerClient extends DB {
   @Override
   public Status read(
       String table, String key, Set<String> fields, Map<String, ByteIterator> result) {
-    if (queriesForReads) {
-      return readUsingQuery(table, key, fields, result);
-    }
-    Iterable<String> columns = fields == null ? STANDARD_FIELDS : fields;
-    try {
-      Struct row = dbClient.singleUse(timestampBound).readRow(table, Key.of(key), columns);
-      decodeStruct(columns, row, result);
-      return Status.OK;
-    } catch (Exception e) {
-      LOGGER.log(Level.INFO, "read()", e);
-      return Status.ERROR;
+    Span span = TracingSupport.startOperationSpan("read", table);
+    long startNanos = System.nanoTime();
+    Status status = Status.ERROR;
+    Throwable error = null;
+    try (Scope scope = TracingSupport.makeCurrent(span)) {
+      if (queriesForReads) {
+        status = readUsingQuery(table, key, fields, result);
+        return status;
+      }
+      Iterable<String> columns = fields == null ? STANDARD_FIELDS : fields;
+      try {
+        Struct row = dbClient.singleUse(timestampBound).readRow(table, Key.of(key), columns);
+        decodeStruct(columns, row, result);
+        status = Status.OK;
+      } catch (Exception e) {
+        error = e;
+        LOGGER.log(Level.INFO, "read()", e);
+        status = Status.ERROR;
+      }
+      return status;
+    } finally {
+      TracingSupport.finishSpan(span, status, error, startNanos);
     }
   }
 
@@ -464,66 +485,98 @@ public class CloudSpannerClient extends DB {
   public Status scan(
       String table, String startKey, int recordCount, Set<String> fields,
       Vector<HashMap<String, ByteIterator>> result) {
-    if (queriesForReads) {
-      return scanUsingQuery(table, startKey, recordCount, fields, result);
-    }
-    Iterable<String> columns = fields == null ? STANDARD_FIELDS : fields;
-    KeySet keySet =
-        KeySet.newBuilder().addRange(KeyRange.closedClosed(Key.of(startKey), Key.of())).build();
-    try (ResultSet resultSet = dbClient.singleUse(timestampBound)
-                                       .read(table, keySet, columns, Options.limit(recordCount))) {
-      while (resultSet.next()) {
-        HashMap<String, ByteIterator> row = new HashMap<>();
-        decodeStruct(columns, resultSet, row);
-        result.add(row);
+    Span span = TracingSupport.startOperationSpan("scan", table);
+    long startNanos = System.nanoTime();
+    Status status = Status.ERROR;
+    Throwable error = null;
+    try (Scope scope = TracingSupport.makeCurrent(span)) {
+      if (queriesForReads) {
+        status = scanUsingQuery(table, startKey, recordCount, fields, result);
+        return status;
       }
-      return Status.OK;
-    } catch (Exception e) {
-      LOGGER.log(Level.INFO, "scan()", e);
-      return Status.ERROR;
+      Iterable<String> columns = fields == null ? STANDARD_FIELDS : fields;
+      KeySet keySet =
+          KeySet.newBuilder().addRange(KeyRange.closedClosed(Key.of(startKey), Key.of())).build();
+      try (ResultSet resultSet =
+          dbClient.singleUse(timestampBound).read(table, keySet, columns, Options.limit(recordCount))) {
+        while (resultSet.next()) {
+          HashMap<String, ByteIterator> row = new HashMap<>();
+          decodeStruct(columns, resultSet, row);
+          result.add(row);
+        }
+        status = Status.OK;
+      } catch (Exception e) {
+        error = e;
+        LOGGER.log(Level.INFO, "scan()", e);
+        status = Status.ERROR;
+      }
+      return status;
+    } finally {
+      TracingSupport.finishSpan(span, status, error, startNanos);
     }
   }
 
   @Override
   public Status update(String table, String key, Map<String, ByteIterator> values) {
-    Mutation.WriteBuilder m = Mutation.newInsertOrUpdateBuilder(table);
-    m.set(PRIMARY_KEY_COLUMN).to(key);
-    for (Map.Entry<String, ByteIterator> e : values.entrySet()) {
-      m.set(e.getKey()).to(e.getValue().toString());
-    }
-    try {
-      dbClient.writeAtLeastOnce(Arrays.asList(m.build()));
-    } catch (Exception e) {
-      LOGGER.log(Level.INFO, "update()", e);
-      return Status.ERROR;
-    }
-    return Status.OK;
-  }
-
-  @Override
-  public Status insert(String table, String key, Map<String, ByteIterator> values) {
-    if (bufferedMutations.size() < batchInserts) {
+    Span span = TracingSupport.startOperationSpan("update", table);
+    long startNanos = System.nanoTime();
+    Status status = Status.ERROR;
+    Throwable error = null;
+    try (Scope scope = TracingSupport.makeCurrent(span)) {
       Mutation.WriteBuilder m = Mutation.newInsertOrUpdateBuilder(table);
       m.set(PRIMARY_KEY_COLUMN).to(key);
       for (Map.Entry<String, ByteIterator> e : values.entrySet()) {
         m.set(e.getKey()).to(e.getValue().toString());
       }
-      bufferedMutations.add(m.build());
-    } else {
-      LOGGER.log(Level.INFO, "Limit of cached mutations reached. The given mutation with key " + key +
-          " is ignored. Is this a retry?");
+      try {
+        dbClient.writeAtLeastOnce(Arrays.asList(m.build()));
+        status = Status.OK;
+      } catch (Exception e) {
+        error = e;
+        LOGGER.log(Level.INFO, "update()", e);
+        status = Status.ERROR;
+      }
+      return status;
+    } finally {
+      TracingSupport.finishSpan(span, status, error, startNanos);
     }
-    if (bufferedMutations.size() < batchInserts) {
-      return Status.BATCHED_OK;
+  }
+
+  @Override
+  public Status insert(String table, String key, Map<String, ByteIterator> values) {
+    Span span = TracingSupport.startOperationSpan("insert", table);
+    long startNanos = System.nanoTime();
+    Status status = Status.ERROR;
+    Throwable error = null;
+    try (Scope scope = TracingSupport.makeCurrent(span)) {
+      if (bufferedMutations.size() < batchInserts) {
+        Mutation.WriteBuilder m = Mutation.newInsertOrUpdateBuilder(table);
+        m.set(PRIMARY_KEY_COLUMN).to(key);
+        for (Map.Entry<String, ByteIterator> e : values.entrySet()) {
+          m.set(e.getKey()).to(e.getValue().toString());
+        }
+        bufferedMutations.add(m.build());
+      } else {
+        LOGGER.log(Level.INFO, "Limit of cached mutations reached. The given mutation with key " + key +
+            " is ignored. Is this a retry?");
+      }
+      if (bufferedMutations.size() < batchInserts) {
+        status = Status.BATCHED_OK;
+        return status;
+      }
+      try {
+        dbClient.writeAtLeastOnce(bufferedMutations);
+        bufferedMutations.clear();
+        status = Status.OK;
+      } catch (Exception e) {
+        error = e;
+        LOGGER.log(Level.INFO, "insert()", e);
+        status = Status.ERROR;
+      }
+      return status;
+    } finally {
+      TracingSupport.finishSpan(span, status, error, startNanos);
     }
-    try {
-      dbClient.writeAtLeastOnce(bufferedMutations);
-      bufferedMutations.clear();
-    } catch (Exception e) {
-      LOGGER.log(Level.INFO, "insert()", e);
-      return Status.ERROR;
-    }
-    return Status.OK;
   }
 
   @Override
@@ -540,13 +593,23 @@ public class CloudSpannerClient extends DB {
 
   @Override
   public Status delete(String table, String key) {
-    try {
-      dbClient.writeAtLeastOnce(Arrays.asList(Mutation.delete(table, Key.of(key))));
-    } catch (Exception e) {
-      LOGGER.log(Level.INFO, "delete()", e);
-      return Status.ERROR;
+    Span span = TracingSupport.startOperationSpan("delete", table);
+    long startNanos = System.nanoTime();
+    Status status = Status.ERROR;
+    Throwable error = null;
+    try (Scope scope = TracingSupport.makeCurrent(span)) {
+      try {
+        dbClient.writeAtLeastOnce(Arrays.asList(Mutation.delete(table, Key.of(key))));
+        status = Status.OK;
+      } catch (Exception e) {
+        error = e;
+        LOGGER.log(Level.INFO, "delete()", e);
+        status = Status.ERROR;
+      }
+      return status;
+    } finally {
+      TracingSupport.finishSpan(span, status, error, startNanos);
     }
-    return Status.OK;
   }
 
   private static void decodeStruct(

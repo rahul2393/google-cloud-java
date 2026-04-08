@@ -58,7 +58,11 @@ spec:
               value: "true"
             - name: YCSB_ENABLE_GRPC_GCP_OTEL_METRICS
               value: "true"
+            - name: YCSB_ENABLE_OTEL_TRACING
+              value: "true"
             - name: OTEL_METRIC_PROJECT_ID
+              value: "outbound-flight"
+            - name: OTEL_TRACE_PROJECT_ID
               value: "outbound-flight"
             - name: OTEL_METRIC_PREFIX
               value: "custom.googleapis.com/ycsb/grpc_gcp"
@@ -66,6 +70,14 @@ spec:
               value: "irahul-ycsb-grpc-gcp"
             - name: OTEL_METRIC_EXPORT_INTERVAL_SECONDS
               value: "10"
+            - name: SPANNER_USE_OPENTELEMETRY_TRACING
+              value: "true"
+            - name: SPANNER_ENABLE_API_TRACING
+              value: "true"
+            - name: SPANNER_ENABLE_EXTENDED_TRACING
+              value: "false"
+            - name: SPANNER_ENABLE_END_TO_END_TRACING
+              value: "false"
             - name: SPANNER_DISABLE_GRPC_GCP_OTEL_METRICS
               value: "false"
             - name: SPANNER_DISABLE_BUILTIN_METRICS

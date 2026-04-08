@@ -24,6 +24,8 @@ import com.google.cloud.spanner.XGoogSpannerRequestId;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.protobuf.ByteString;
+import com.google.protobuf.ListValue;
+import com.google.protobuf.Value;
 import com.google.spanner.v1.BeginTransactionRequest;
 import com.google.spanner.v1.CommitRequest;
 import com.google.spanner.v1.CommitResponse;
@@ -420,7 +422,8 @@ final class KeyAwareChannel extends ManagedChannel {
       MethodDescriptor<?, ?> methodDescriptor,
       @Nullable ChannelEndpoint endpoint,
       boolean usedDefaultEndpoint,
-      @Nullable RoutingHint routingHint) {
+      @Nullable RoutingHint routingHint,
+      @Nullable String requestKeyForLogs) {
     if (!logger.isLoggable(Level.FINE) || routingHint == null) {
       return;
     }
@@ -431,7 +434,7 @@ final class KeyAwareChannel extends ManagedChannel {
         Level.FINE,
         "Location-aware routing outcome for {0}: endpoint={1}, used_default_endpoint={2},"
             + " database_id={3}, group_uid={4}, split_id={5}, tablet_uid={6},"
-            + " skipped_tablet_uid_count={7}",
+            + " skipped_tablet_uid_count={7}, request_key={8}",
         new Object[] {
           methodDescriptor.getFullMethodName(),
           endpoint == null ? "<null>" : endpoint.getAddress(),
@@ -440,7 +443,8 @@ final class KeyAwareChannel extends ManagedChannel {
           routingHint.getGroupUid(),
           routingHint.getSplitId(),
           routingHint.getTabletUid(),
-          routingHint.getSkippedTabletUidCount()
+          routingHint.getSkippedTabletUidCount(),
+          requestKeyForLogs == null ? "<unknown>" : requestKeyForLogs
         });
   }
 
@@ -477,6 +481,7 @@ final class KeyAwareChannel extends ManagedChannel {
     @Nullable private ChannelEndpoint selectedEndpoint;
     @Nullable private ByteString transactionIdToClear;
     @Nullable private RoutingHint appliedRoutingHint;
+    @Nullable private String requestKeyForLogs;
     private boolean allowDefaultAffinity;
     private long pendingRequests;
     private boolean pendingHalfClose;
@@ -547,6 +552,7 @@ final class KeyAwareChannel extends ManagedChannel {
         if (message instanceof ReadRequest) {
           ReadRequest.Builder reqBuilder = ((ReadRequest) message).toBuilder();
           maybeTrackReadOnlyBegin(reqBuilder.getTransaction());
+          requestKeyForLogs = extractSingleReadKeyForLogs(reqBuilder);
           RoutingDecision routing = routeFromRequest(reqBuilder);
           finder = routing.finder;
           endpoint = routing.endpoint;
@@ -623,11 +629,13 @@ final class KeyAwareChannel extends ManagedChannel {
         selectedEndpoint = endpoint;
         this.channelFinder = finder;
         this.appliedRoutingHint = routingHint;
+        this.requestKeyForLogs = requestKeyForLogs;
 
         // Record real traffic for idle eviction tracking.
         parentChannel.onRequestRouted(endpoint);
 
-        logRoutingHintOutcome(methodDescriptor, endpoint, usedDefaultEndpoint, routingHint);
+        logRoutingHintOutcome(
+            methodDescriptor, endpoint, usedDefaultEndpoint, routingHint, requestKeyForLogs);
         recordRouteSelectionTrace(
             methodDescriptor,
             endpoint.getAddress(),
@@ -770,6 +778,34 @@ final class KeyAwareChannel extends ManagedChannel {
           && selector.getBegin().hasReadOnly()) {
         isReadOnlyBegin = true;
         readOnlyIsStrong = selector.getBegin().getReadOnly().getStrong();
+      }
+    }
+
+    @Nullable
+    private static String extractSingleReadKeyForLogs(ReadRequest.Builder reqBuilder) {
+      if (reqBuilder == null || !reqBuilder.hasKeySet()) {
+        return null;
+      }
+      if (reqBuilder.getKeySet().getKeysCount() != 1 || reqBuilder.getKeySet().getRangesCount() != 0) {
+        return null;
+      }
+      ListValue key = reqBuilder.getKeySet().getKeys(0);
+      if (key.getValuesCount() != 1) {
+        return key.toString();
+      }
+      Value value = key.getValues(0);
+      switch (value.getKindCase()) {
+        case STRING_VALUE:
+          return value.getStringValue();
+        case NUMBER_VALUE:
+          return String.valueOf(value.getNumberValue());
+        case BOOL_VALUE:
+          return String.valueOf(value.getBoolValue());
+        case NULL_VALUE:
+          return "null";
+        case KIND_NOT_SET:
+        default:
+          return value.toString();
       }
     }
 

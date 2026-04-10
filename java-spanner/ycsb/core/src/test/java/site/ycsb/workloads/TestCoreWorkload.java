@@ -17,6 +17,7 @@
 package site.ycsb.workloads;
 
 import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.assertEquals;
 
 import java.util.Properties;
 
@@ -66,5 +67,25 @@ public class TestCoreWorkload {
   @Test (expectedExceptions = IllegalArgumentException.class)
   public void createOperationChooserNullProperties() {
     CoreWorkload.createOperationGenerator(null);
+  }
+
+  @Test
+  public void applyClientKeyOffsetRotatesShardOnly() {
+    assertEquals(CoreWorkload.applyClientKeyOffset(105, 100, 10, 3), 108L);
+    assertEquals(CoreWorkload.applyClientKeyOffset(109, 100, 10, 3), 102L);
+    assertEquals(CoreWorkload.applyClientKeyOffset(110, 100, 10, 3), 113L);
+  }
+
+  @Test
+  public void resolveClientKeyOffsetHostnameUsesStableHash() {
+    assertEquals(
+        CoreWorkload.resolveClientKeyOffset("hostname", 1000, "ycsb-worker-7"),
+        Math.floorMod((long) "ycsb-worker-7".hashCode(), 1000));
+  }
+
+  @Test
+  public void resolveClientKeyOffsetNumericWrapsWithinShard() {
+    assertEquals(CoreWorkload.resolveClientKeyOffset("17", 10, "ignored"), 7L);
+    assertEquals(CoreWorkload.resolveClientKeyOffset("-3", 10, "ignored"), 7L);
   }
 }

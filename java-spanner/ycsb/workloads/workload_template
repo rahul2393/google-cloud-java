@@ -112,6 +112,10 @@ requestdistribution=zipfian
 #requestdistribution=uniform
 #requestdistribution=latest
 
+# Rotate each client's logical keyspace by a fixed offset before building keys.
+# Accepts a numeric offset, "random", or "hostname".
+#clientkeyoffset=0
+
 # Percentage of data items that constitute the hot set
 hotspotdatafraction=0.2
 

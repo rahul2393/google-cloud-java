@@ -23,7 +23,10 @@ import site.ycsb.generator.UniformLongGenerator;
 import site.ycsb.measurements.Measurements;
 
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * The core benchmark scenario. Represents a set of clients doing simple CRUD operations. The
@@ -54,6 +57,10 @@ import java.util.*;
  * YCSB instance (default: 0)
  * <LI><b>insertcount</b>: for parallel loads and runs, defines the number of records for this
  * YCSB instance (default: recordcount)
+ * <LI><b>clientkeyoffset</b>: rotates this client's logical keyspace by a fixed offset before
+ * keys are built. Accepts a numeric offset, "random", or "hostname". The offset is applied within
+ * the configured insertstart/insertcount shard for existing keys and is reused for the lifetime of
+ * the client process. (default: 0)
  * <LI><b>zeropadding</b>: for generating a record sequence compatible with string sort order by
  * 0 padding the record number. Controls the number of 0s to use for padding. (default: 1)
  * For example for row 5, with zeropadding=1 you get 'user5' key and with zeropading=8 you get
@@ -272,6 +279,17 @@ public class CoreWorkload extends Workload {
    */
   public static final String ZERO_PADDING_PROPERTY_DEFAULT = "1";
 
+  /**
+   * The name of the property for rotating each client's keyspace by a fixed offset. Accepts a
+   * numeric value, "random", or "hostname".
+   */
+  public static final String CLIENT_KEY_OFFSET_PROPERTY = "clientkeyoffset";
+
+  /**
+   * The default client key offset.
+   */
+  public static final String CLIENT_KEY_OFFSET_PROPERTY_DEFAULT = "0";
+
 
   /**
    * The name of the property for the min scan length (number of records).
@@ -368,6 +386,9 @@ public class CoreWorkload extends Workload {
   protected int zeropadding;
   protected int insertionRetryLimit;
   protected int insertionRetryInterval;
+  protected long insertstart;
+  protected long insertcount;
+  protected long clientkeyoffset;
 
   private Measurements measurements = Measurements.getMeasurements();
 
@@ -382,6 +403,57 @@ public class CoreWorkload extends Workload {
       prekey += '0';
     }
     return prekey + value;
+  }
+
+  static long resolveClientKeyOffset(
+      String configuredOffset, long keySpaceSize, String hostIdentifier) {
+    if (keySpaceSize <= 1) {
+      return 0;
+    }
+    String value =
+        configuredOffset == null
+            ? CLIENT_KEY_OFFSET_PROPERTY_DEFAULT
+            : configuredOffset.trim();
+    if (value.isEmpty() || CLIENT_KEY_OFFSET_PROPERTY_DEFAULT.equals(value)) {
+      return 0;
+    }
+    if ("random".equalsIgnoreCase(value)) {
+      return ThreadLocalRandom.current().nextLong(keySpaceSize);
+    }
+    if ("hostname".equalsIgnoreCase(value)) {
+      if (hostIdentifier == null || hostIdentifier.isEmpty()) {
+        return 0;
+      }
+      return Math.floorMod((long) hostIdentifier.hashCode(), keySpaceSize);
+    }
+    return Math.floorMod(Long.parseLong(value), keySpaceSize);
+  }
+
+  private static String getHostIdentifier() {
+    String hostIdentifier = System.getenv("HOSTNAME");
+    if (hostIdentifier != null && !hostIdentifier.isEmpty()) {
+      return hostIdentifier;
+    }
+    try {
+      return InetAddress.getLocalHost().getHostName();
+    } catch (UnknownHostException e) {
+      return "";
+    }
+  }
+
+  static long applyClientKeyOffset(
+      long keynum, long insertstart, long insertcount, long clientkeyoffset) {
+    if (clientkeyoffset == 0) {
+      return keynum;
+    }
+    if (keynum >= insertstart && keynum - insertstart < insertcount) {
+      return insertstart + Math.floorMod(keynum - insertstart + clientkeyoffset, insertcount);
+    }
+    return keynum + clientkeyoffset;
+  }
+
+  private long applyClientKeyOffset(long keynum) {
+    return applyClientKeyOffset(keynum, insertstart, insertcount, clientkeyoffset);
   }
 
   protected static NumberGenerator getFieldLengthGenerator(Properties p) throws WorkloadException {
@@ -445,9 +517,8 @@ public class CoreWorkload extends Workload {
     String scanlengthdistrib =
         p.getProperty(SCAN_LENGTH_DISTRIBUTION_PROPERTY, SCAN_LENGTH_DISTRIBUTION_PROPERTY_DEFAULT);
 
-    long insertstart =
-        Long.parseLong(p.getProperty(INSERT_START_PROPERTY, INSERT_START_PROPERTY_DEFAULT));
-    long insertcount=
+    insertstart = Long.parseLong(p.getProperty(INSERT_START_PROPERTY, INSERT_START_PROPERTY_DEFAULT));
+    insertcount =
         Long.parseLong(p.getProperty(INSERT_COUNT_PROPERTY, String.valueOf(recordcount - insertstart)));
     // Confirm valid values for insertstart and insertcount in relation to recordcount
     if (recordcount < (insertstart + insertcount)) {
@@ -455,8 +526,30 @@ public class CoreWorkload extends Workload {
       System.err.println("recordcount must be bigger than insertstart + insertcount.");
       System.exit(-1);
     }
+    try {
+      clientkeyoffset =
+          resolveClientKeyOffset(
+              p.getProperty(CLIENT_KEY_OFFSET_PROPERTY, CLIENT_KEY_OFFSET_PROPERTY_DEFAULT),
+              insertcount,
+              getHostIdentifier());
+    } catch (IllegalArgumentException e) {
+      throw new WorkloadException(
+          "Invalid value for " + CLIENT_KEY_OFFSET_PROPERTY + ": "
+              + p.getProperty(CLIENT_KEY_OFFSET_PROPERTY),
+          e);
+    }
     zeropadding =
         Integer.parseInt(p.getProperty(ZERO_PADDING_PROPERTY, ZERO_PADDING_PROPERTY_DEFAULT));
+    if (clientkeyoffset != 0) {
+      System.out.println(
+          "Using client key offset "
+              + clientkeyoffset
+              + " within shard ["
+              + insertstart
+              + ", "
+              + (insertstart + insertcount - 1)
+              + "]");
+    }
 
     readallfields = Boolean.parseBoolean(
         p.getProperty(READ_ALL_FIELDS_PROPERTY, READ_ALL_FIELDS_PROPERTY_DEFAULT));
@@ -611,7 +704,7 @@ public class CoreWorkload extends Workload {
    */
   @Override
   public boolean doInsert(DB db, Object threadstate) {
-    int keynum = keysequence.nextValue().intValue();
+    long keynum = applyClientKeyOffset(keysequence.nextValue().longValue());
     String dbkey = CoreWorkload.buildKeyName(keynum, zeropadding, orderedinserts);
     HashMap<String, ByteIterator> values = buildValues(dbkey);
 
@@ -716,7 +809,7 @@ public class CoreWorkload extends Workload {
         keynum = keychooser.nextValue().longValue();
       } while (keynum > transactioninsertkeysequence.lastValue());
     }
-    return keynum;
+    return applyClientKeyOffset(keynum);
   }
 
   public void doTransactionRead(DB db) {
@@ -840,7 +933,7 @@ public class CoreWorkload extends Workload {
 
   public void doTransactionInsert(DB db) {
     // choose the next key
-    long keynum = transactioninsertkeysequence.nextValue();
+    long keynum = applyClientKeyOffset(transactioninsertkeysequence.nextValue());
 
     try {
       String dbkey = CoreWorkload.buildKeyName(keynum, zeropadding, orderedinserts);

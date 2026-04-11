@@ -14,6 +14,8 @@ COPY --chown=1000:1000 sdk-platform-java /workspace/sdk-platform-java
 COPY --chown=1000:1000 google-cloud-pom-parent /workspace/google-cloud-pom-parent
 COPY --chown=1000:1000 google-cloud-jar-parent /workspace/google-cloud-jar-parent
 COPY --chown=1000:1000 google-auth-library-java /workspace/google-auth-library-java
+COPY --chown=1000:1000 java-monitoring /workspace/java-monitoring
+COPY --chown=1000:1000 java-trace /workspace/java-trace
 COPY --chown=1000:1000 java-spanner /workspace/java-spanner
 
 # Install the locally built grpc-gcp snapshot used for YCSB experiments before
@@ -39,6 +41,10 @@ RUN mvn -f /workspace/sdk-platform-java/java-shared-dependencies/first-party-dep
 RUN mvn -f /workspace/sdk-platform-java/java-shared-dependencies/pom.xml clean install -DskipTests -Dmaven.test.skip=true -Dcheckstyle.skip
 RUN mvn -f /workspace/sdk-platform-java/java-iam/pom.xml clean install -DskipTests -Dmaven.test.skip=true -Dcheckstyle.skip
 RUN mvn -f /workspace/sdk-platform-java/java-core/pom.xml clean install -DskipTests -Dmaven.test.skip=true -Dcheckstyle.skip
+
+# Build unpublished java-monitoring and java-trace dependencies from source.
+RUN mvn -f /workspace/java-monitoring/pom.xml install -DskipTests -Dmaven.test.skip=true -Dclirr.skip -Dmaven.javadoc.skip=true -Dcheckstyle.skip -pl google-cloud-monitoring -am
+RUN mvn -f /workspace/java-trace/pom.xml install -DskipTests -Dmaven.test.skip=true -Dclirr.skip -Dmaven.javadoc.skip=true -Dcheckstyle.skip -pl google-cloud-trace -am
 
 # Build the java-spanner library and then the YCSB shaded jar.
 RUN mvn -f /workspace/java-spanner/pom.xml install -DskipTests -Dmaven.test.skip=true -Dclirr.skip -Dmaven.javadoc.skip=true -Dcheckstyle.skip -pl google-cloud-spanner -am

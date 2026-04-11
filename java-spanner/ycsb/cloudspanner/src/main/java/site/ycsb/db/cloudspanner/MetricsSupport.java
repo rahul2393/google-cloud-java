@@ -22,13 +22,20 @@ import com.google.cloud.spanner.SpannerOptions;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.sdk.common.CompletableResultCode;
+import io.opentelemetry.sdk.metrics.InstrumentType;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
 import io.opentelemetry.sdk.metrics.SdkMeterProviderBuilder;
+import io.opentelemetry.sdk.metrics.data.AggregationTemporality;
+import io.opentelemetry.sdk.metrics.data.MetricData;
 import io.opentelemetry.sdk.metrics.export.MetricExporter;
 import io.opentelemetry.sdk.metrics.export.PeriodicMetricReader;
 import io.opentelemetry.sdk.resources.Resource;
 import java.time.Duration;
+import java.util.Collection;
 import java.util.Properties;
+import java.util.StringJoiner;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -63,6 +70,7 @@ final class MetricsSupport {
   private static volatile String configuredMetricPrefix = "<disabled>";
   private static volatile String configuredServiceName = "<disabled>";
   private static volatile boolean exportBuiltInMetricsToOpenTelemetry;
+  private static volatile int configuredExportIntervalSeconds = DEFAULT_EXPORT_INTERVAL_SECONDS;
 
   private MetricsSupport() {}
 
@@ -144,6 +152,7 @@ final class MetricsSupport {
             PROP_EXPORT_INTERVAL_SECONDS,
             ENV_EXPORT_INTERVAL_SECONDS,
             DEFAULT_EXPORT_INTERVAL_SECONDS);
+    configuredExportIntervalSeconds = exportIntervalSeconds;
 
     Resource resource =
         Resource.getDefault()
@@ -157,7 +166,11 @@ final class MetricsSupport {
             .setProjectId(configuredProjectId)
             .setPrefix(configuredMetricPrefix)
             .build();
-    MetricExporter metricExporter = GoogleCloudMetricExporter.createWithConfiguration(metricConfig);
+    MetricExporter metricExporter =
+        new DiagnosticMetricExporter(
+            GoogleCloudMetricExporter.createWithConfiguration(metricConfig),
+            configuredMetricPrefix,
+            configuredProjectId);
 
     SdkMeterProviderBuilder sdkMeterProviderBuilder =
         SdkMeterProvider.builder()
@@ -172,6 +185,17 @@ final class MetricsSupport {
     SdkMeterProvider sdkMeterProvider = sdkMeterProviderBuilder.build();
 
     openTelemetrySdk = OpenTelemetrySdk.builder().setMeterProvider(sdkMeterProvider).build();
+    LOGGER.log(
+        Level.INFO,
+        "Configured OTEL metrics exporter: project={0}, prefix={1}, service={2}, "
+            + "intervalSeconds={3}, exportBuiltInMetricsToOpenTelemetry={4}",
+        new Object[] {
+            configuredProjectId,
+            configuredMetricPrefix,
+            configuredServiceName,
+            configuredExportIntervalSeconds,
+            isBuiltInMetricsExportEnabled(properties)
+        });
     return openTelemetrySdk;
   }
 
@@ -201,5 +225,113 @@ final class MetricsSupport {
       return value;
     }
     return defaultValue;
+  }
+
+  private static final class DiagnosticMetricExporter implements MetricExporter {
+    private final MetricExporter delegate;
+    private final String metricPrefix;
+    private final String projectId;
+    private final AtomicLong exportAttempts = new AtomicLong();
+
+    private DiagnosticMetricExporter(
+        MetricExporter delegate, String metricPrefix, String projectId) {
+      this.delegate = delegate;
+      this.metricPrefix = metricPrefix;
+      this.projectId = projectId;
+    }
+
+    @Override
+    public CompletableResultCode export(Collection<MetricData> metrics) {
+      long attempt = exportAttempts.incrementAndGet();
+      LOGGER.log(
+          Level.INFO,
+          "OTEL metric export attempt #{0}: metricCount={1}, pointCount={2}, "
+              + "prefix={3}, project={4}, metrics={5}",
+          new Object[] {
+              attempt,
+              metrics.size(),
+              countPoints(metrics),
+              metricPrefix,
+              projectId,
+              summarizeMetricNames(metrics)
+          });
+      try {
+        CompletableResultCode result = delegate.export(metrics);
+        result.whenComplete(
+            () ->
+                LOGGER.log(
+                    result.isSuccess() ? Level.FINE : Level.WARNING,
+                    "OTEL metric export attempt #{0} completed: success={1}",
+                    new Object[] {attempt, result.isSuccess()}));
+        return result;
+      } catch (RuntimeException e) {
+        LOGGER.log(
+            Level.WARNING,
+            "OTEL metric export attempt #"
+                + attempt
+                + " threw an exception for metrics="
+                + summarizeMetricNames(metrics),
+            e);
+        throw e;
+      }
+    }
+
+    @Override
+    public CompletableResultCode flush() {
+      return delegate.flush();
+    }
+
+    @Override
+    public CompletableResultCode shutdown() {
+      return delegate.shutdown();
+    }
+
+    @Override
+    public AggregationTemporality getAggregationTemporality(InstrumentType instrumentType) {
+      return delegate.getAggregationTemporality(instrumentType);
+    }
+
+    private static long countPoints(Collection<MetricData> metrics) {
+      long points = 0L;
+      for (MetricData metric : metrics) {
+        points += getPointCount(metric);
+      }
+      return points;
+    }
+
+    private static int getPointCount(MetricData metric) {
+      switch (metric.getType()) {
+      case LONG_GAUGE:
+        return metric.getLongGaugeData().getPoints().size();
+      case LONG_SUM:
+        return metric.getLongSumData().getPoints().size();
+      case DOUBLE_GAUGE:
+        return metric.getDoubleGaugeData().getPoints().size();
+      case DOUBLE_SUM:
+        return metric.getDoubleSumData().getPoints().size();
+      case HISTOGRAM:
+        return metric.getHistogramData().getPoints().size();
+      case EXPONENTIAL_HISTOGRAM:
+        return metric.getExponentialHistogramData().getPoints().size();
+      case SUMMARY:
+        return metric.getSummaryData().getPoints().size();
+      default:
+        return 0;
+      }
+    }
+
+    private static String summarizeMetricNames(Collection<MetricData> metrics) {
+      StringJoiner joiner = new StringJoiner(", ");
+      int count = 0;
+      for (MetricData metric : metrics) {
+        joiner.add(metric.getName() + "[" + getPointCount(metric) + "]");
+        count++;
+        if (count == 8 && metrics.size() > count) {
+          joiner.add("...");
+          break;
+        }
+      }
+      return joiner.toString();
+    }
   }
 }

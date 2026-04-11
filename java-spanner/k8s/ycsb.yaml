@@ -1,0 +1,88 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  namespace: spanner-ns
+  name: ycsb-irahul-run
+spec:
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: ycsb-irahul-run
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: ycsb-irahul-client
+          image: us-west1-docker.pkg.dev/outbound-flight/spanner-box/ycsb-client:latest
+          imagePullPolicy: Always
+          ports:
+            - name: jmx
+              containerPort: 5000
+              protocol: TCP
+            - name: jdwp
+              containerPort: 5005
+              protocol: TCP
+            - name: arthas-web
+              containerPort: 8563
+              protocol: TCP
+          args:
+            - run
+            - cloudspanner
+            - -P
+            - workloads/workloadb
+            - -P
+            - cloudspanner/conf/cloudspanner.properties
+            - -p
+            - cloudspanner.dynamicchannelpool.initsize=1
+            - -p
+            - recordcount=1000000000000
+            - -p
+            - operationcount=0
+            - -p
+            - maxexecutiontime=18000
+            - -threads
+            - "50"
+            - -s
+          resources:
+            requests:
+              cpu: "7"
+              memory: "25Gi"
+            limits:
+              cpu: "7"
+              memory: "25Gi"
+          env:
+            - name: GOOGLE_SPANNER_EXPERIMENTAL_LOCATION_API
+              value: "true"
+            - name: YCSB_ENABLE_GRPC_GCP_OTEL_METRICS
+              value: "true"
+            - name: YCSB_ENABLE_OTEL_TRACING
+              value: "true"
+            - name: OTEL_METRIC_PROJECT_ID
+              value: "outbound-flight"
+            - name: OTEL_TRACE_PROJECT_ID
+              value: "outbound-flight"
+            - name: OTEL_METRIC_PREFIX
+              value: "custom.googleapis.com/ycsb/grpc_gcp"
+            - name: OTEL_SERVICE_NAME
+              value: "irahul-ycsb-grpc-gcp"
+            - name: OTEL_METRIC_EXPORT_INTERVAL_SECONDS
+              value: "10"
+            - name: SPANNER_USE_OPENTELEMETRY_TRACING
+              value: "true"
+            - name: SPANNER_ENABLE_API_TRACING
+              value: "true"
+            - name: SPANNER_ENABLE_EXTENDED_TRACING
+              value: "false"
+            - name: SPANNER_ENABLE_END_TO_END_TRACING
+              value: "false"
+            - name: SPANNER_DISABLE_GRPC_GCP_OTEL_METRICS
+              value: "false"
+            - name: SPANNER_DISABLE_BUILTIN_METRICS
+              value: "true"
+            - name: SPANNER_DISABLE_DIRECT_ACCESS_GRPC_BUILTIN_METRICS
+              value: "true"
+            - name: JAVA_TOOL_OPTIONS
+              value: "-Xms16g -Xmx16g -XX:+AlwaysPreTouch -XX:+UseG1GC -Droot.level=ERROR -Djava.util.logging.config.file=/ycsb/cloudspanner/conf/logging-debug.properties -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005 -Dcom.sun.management.jmxremote=true -Dcom.sun.management.jmxremote.port=5000 -Dcom.sun.management.jmxremote.rmi.port=5000 -Dcom.sun.management.jmxremote.local.only=false -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Djava.rmi.server.hostname=127.0.0.1"

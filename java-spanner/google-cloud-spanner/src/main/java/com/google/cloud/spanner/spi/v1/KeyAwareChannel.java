@@ -317,13 +317,15 @@ final class KeyAwareChannel extends ManagedChannel {
   }
 
   private void maybeExcludeEndpointOnNextCall(
-      @Nullable ChannelEndpoint endpoint, @Nullable String logicalRequestKey) {
+      @Nullable ChannelEndpoint endpoint,
+      @Nullable String logicalRequestKey,
+      @Nullable String routeMethod) {
     if (endpoint == null || logicalRequestKey == null) {
       return;
     }
     String address = endpoint.getAddress();
     if (!defaultEndpointAddress.equals(address)) {
-      routeDecisionSummaryLogger.recordResourceExhaustedExclusion(address);
+      routeDecisionSummaryLogger.recordResourceExhaustedExclusion(routeMethod, address);
       excludedEndpointsForLogicalRequest
           .asMap()
           .compute(
@@ -623,6 +625,7 @@ final class KeyAwareChannel extends ManagedChannel {
         ChannelEndpoint endpoint = null;
         ChannelFinder finder = null;
         RouteSelectionDebugInfo debugInfo = new RouteSelectionDebugInfo();
+        debugInfo.setRouteMethod(methodDescriptor.getFullMethodName());
 
         if (message instanceof ReadRequest) {
           ReadRequest.Builder reqBuilder = ((ReadRequest) message).toBuilder();
@@ -743,6 +746,7 @@ final class KeyAwareChannel extends ManagedChannel {
             finder != null,
             debugInfo);
         parentChannel.routeDecisionSummaryLogger.recordAttempt(
+            methodDescriptor.getFullMethodName(),
             parentChannel.defaultEndpointAddress.equals(endpoint.getAddress()),
             hadResourceExhaustedExcludedEndpoints(),
             parentChannel.defaultEndpointAddress.equals(endpoint.getAddress())
@@ -1040,7 +1044,9 @@ final class KeyAwareChannel extends ManagedChannel {
     public void onClose(io.grpc.Status status, Metadata trailers) {
       if (status.getCode() == io.grpc.Status.Code.RESOURCE_EXHAUSTED) {
         call.parentChannel.maybeExcludeEndpointOnNextCall(
-            call.selectedEndpoint, call.logicalRequestKey);
+            call.selectedEndpoint,
+            call.logicalRequestKey,
+            call.methodDescriptor.getFullMethodName());
       }
       call.maybeClearAffinity();
       super.onClose(status, trailers);

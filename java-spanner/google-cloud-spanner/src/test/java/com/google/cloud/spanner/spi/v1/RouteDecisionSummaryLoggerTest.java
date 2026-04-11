@@ -30,11 +30,13 @@ public class RouteDecisionSummaryLoggerTest {
     RouteDecisionSummaryLogger logger = new RouteDecisionSummaryLogger();
 
     logger.recordAttempt(
+        "google.spanner.v1.Spanner/StreamingRead",
         /* usedDefaultEndpoint= */ false,
         /* hadResourceExhaustedExclusion= */ false,
         "server-1:1234",
         routedSelection(/* selectedFirstReplica= */ true, /* selectedLeader= */ true));
     logger.recordAttempt(
+        "google.spanner.v1.Spanner/StreamingRead",
         /* usedDefaultEndpoint= */ true,
         /* hadResourceExhaustedExclusion= */ false,
         null,
@@ -43,6 +45,7 @@ public class RouteDecisionSummaryLoggerTest {
             /* leaderSkippedTransientFailure= */ false,
             /* leaderSkippedEndpointNotReady= */ true));
     logger.recordAttempt(
+        "google.spanner.v1.Spanner/StreamingRead",
         /* usedDefaultEndpoint= */ true,
         /* hadResourceExhaustedExclusion= */ false,
         null,
@@ -51,11 +54,13 @@ public class RouteDecisionSummaryLoggerTest {
             /* leaderSkippedTransientFailure= */ false,
             /* leaderSkippedEndpointNotReady= */ false));
     logger.recordAttempt(
+        "google.spanner.v1.Spanner/Commit",
         /* usedDefaultEndpoint= */ false,
         /* hadResourceExhaustedExclusion= */ true,
         "server-2:1234",
         routedSelection(/* selectedFirstReplica= */ false, /* selectedLeader= */ false));
     logger.recordAttempt(
+        "google.spanner.v1.Spanner/Commit",
         /* usedDefaultEndpoint= */ true,
         /* hadResourceExhaustedExclusion= */ false,
         null,
@@ -63,9 +68,9 @@ public class RouteDecisionSummaryLoggerTest {
             "no_healthy_tablet_for_group",
             /* leaderSkippedTransientFailure= */ true,
             /* leaderSkippedEndpointNotReady= */ false));
-    logger.recordResourceExhaustedExclusion("server-1:1234");
-    logger.recordResourceExhaustedExclusion("server-1:1234");
-    logger.recordResourceExhaustedExclusion("server-2:1234");
+    logger.recordResourceExhaustedExclusion("google.spanner.v1.Spanner/StreamingRead", "server-1:1234");
+    logger.recordResourceExhaustedExclusion("google.spanner.v1.Spanner/StreamingRead", "server-1:1234");
+    logger.recordResourceExhaustedExclusion("google.spanner.v1.Spanner/Commit", "server-2:1234");
     logger.recordTransientFailureSkip("server-3:1234");
     logger.recordTransientFailureSkip("server-3:1234");
     logger.recordEndpointNotReadySkip("server-4:1234");
@@ -77,6 +82,10 @@ public class RouteDecisionSummaryLoggerTest {
     assertThat(snapshot.defaultEndpointRequests).isEqualTo(3);
     assertThat(snapshot.firstReplicaSelections).isEqualTo(1);
     assertThat(snapshot.leaderSelections).isEqualTo(1);
+    assertThat(snapshot.leaderFirstSelections).isEqualTo(1);
+    assertThat(snapshot.leaderNonFirstSelections).isEqualTo(0);
+    assertThat(snapshot.nonLeaderFirstSelections).isEqualTo(0);
+    assertThat(snapshot.nonLeaderNonFirstSelections).isEqualTo(1);
     assertThat(snapshot.leaderSkippedTransientFailure).isEqualTo(1);
     assertThat(snapshot.leaderSkippedEndpointNotReady).isEqualTo(1);
     assertThat(snapshot.defaultDueToNoHealthyEndpoint).isEqualTo(2);

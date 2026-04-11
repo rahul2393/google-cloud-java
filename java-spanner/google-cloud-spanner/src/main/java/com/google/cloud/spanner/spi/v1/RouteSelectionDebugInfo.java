@@ -26,6 +26,7 @@ final class RouteSelectionDebugInfo {
   private static final int MAX_KEY_HEX_CHARS = 96;
 
   @Nullable private String routeSource;
+  @Nullable private String routeMethod;
   @Nullable private String defaultReasonCode;
   @Nullable private String defaultReasonDetail;
   @Nullable private String requestKeyHex;
@@ -53,6 +54,15 @@ final class RouteSelectionDebugInfo {
   @Nullable
   String getRouteSource() {
     return routeSource;
+  }
+
+  void setRouteMethod(String routeMethod) {
+    this.routeMethod = routeMethod;
+  }
+
+  @Nullable
+  String getRouteMethod() {
+    return routeMethod;
   }
 
   void setDefaultReason(String code, @Nullable String detail) {

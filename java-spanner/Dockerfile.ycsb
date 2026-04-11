@@ -13,15 +13,8 @@ USER 1000
 COPY --chown=1000:1000 sdk-platform-java /workspace/sdk-platform-java
 COPY --chown=1000:1000 google-cloud-pom-parent /workspace/google-cloud-pom-parent
 COPY --chown=1000:1000 google-cloud-jar-parent /workspace/google-cloud-jar-parent
+COPY --chown=1000:1000 google-auth-library-java /workspace/google-auth-library-java
 COPY --chown=1000:1000 java-spanner /workspace/java-spanner
-
-# Some local sdk-platform-java checkouts can temporarily reference an unpublished
-# google-auth BOM version in gapic-generator-java-bom/pom.xml. Align it with the
-# tested version recorded in dependencies.txt before bootstrapping Maven artifacts.
-RUN GOOGLE_AUTH_VERSION="$(sed -n 's/^com.google.auth:google-auth-library-bom,google.auth=//p' /workspace/sdk-platform-java/dependencies.txt | head -n 1)" \
- && test -n "${GOOGLE_AUTH_VERSION}" \
- && sed -i "s#<version>1.44.0</version><!-- {x-version-update:google-auth-library:current} -->#<version>${GOOGLE_AUTH_VERSION}</version><!-- {x-version-update:google-auth-library:current} -->#g" /workspace/sdk-platform-java/gapic-generator-java-bom/pom.xml \
- && sed -i "s#<version>1.44.0</version><!-- {x-version-update:google-auth-library-parent:current} -->#<version>${GOOGLE_AUTH_VERSION}</version><!-- {x-version-update:google-auth-library-parent:current} -->#g" /workspace/sdk-platform-java/gax-java/pom.xml
 
 # Install the locally built grpc-gcp snapshot used for YCSB experiments before
 # building google-cloud-spanner so Maven resolves the staged version.
@@ -31,6 +24,10 @@ RUN mvn install:install-file \
     -Dversion=1.9.3-SNAPSHOT \
     -Dpackaging=jar \
     -Dfile=/workspace/java-spanner/third-party/grpc-gcp/grpc-gcp-1.9.3-SNAPSHOT.jar
+
+# Build google-auth-library locally so Maven resolves the unpublished version
+# referenced by gax-java and gapic-generator-java-bom.
+RUN mvn -f /workspace/google-auth-library-java/pom.xml clean install -DskipTests -Dmaven.test.skip=true -Dcheckstyle.skip
 
 # Bootstrap the local SNAPSHOT artifacts required by java-spanner.
 RUN mvn -f /workspace/sdk-platform-java/pom.xml -pl gapic-generator-java-bom,java-core/google-cloud-core-bom -am clean install -DskipTests -Dmaven.test.skip=true -Dcheckstyle.skip

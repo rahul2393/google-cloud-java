@@ -40,6 +40,7 @@ import java.util.stream.Collectors;
 public class BuiltInMetricsConstant {
 
   public static final String METER_NAME = "spanner.googleapis.com/internal/client";
+  public static final String CUSTOM_EXPORT_METER_NAME = "spanner/internal/client";
   public static final String GAX_METER_NAME = OpenTelemetryMetricsRecorder.GAX_METER_NAME;
   public static final String GRPC_GCP_METER_NAME = "grpc-gcp";
   static final String SPANNER_METER_NAME = "spanner-java";
@@ -206,9 +207,18 @@ public class BuiltInMetricsConstant {
           "grpc.client.call.duration");
 
   static Map<InstrumentSelector, View> getAllViews() {
+    return getViews(METER_NAME);
+  }
+
+  static Map<InstrumentSelector, View> getCustomExporterViews() {
+    return getViews(CUSTOM_EXPORT_METER_NAME);
+  }
+
+  private static Map<InstrumentSelector, View> getViews(String exportedMetricPrefix) {
     ImmutableMap.Builder<InstrumentSelector, View> views = ImmutableMap.builder();
     defineView(
         views,
+        exportedMetricPrefix,
         BuiltInMetricsConstant.GAX_METER_NAME,
         BuiltInMetricsConstant.OPERATION_LATENCY_NAME,
         BuiltInMetricsConstant.OPERATION_LATENCIES_NAME,
@@ -217,6 +227,7 @@ public class BuiltInMetricsConstant {
         "ms");
     defineView(
         views,
+        exportedMetricPrefix,
         BuiltInMetricsConstant.GAX_METER_NAME,
         BuiltInMetricsConstant.ATTEMPT_LATENCY_NAME,
         BuiltInMetricsConstant.ATTEMPT_LATENCIES_NAME,
@@ -225,6 +236,7 @@ public class BuiltInMetricsConstant {
         "ms");
     defineView(
         views,
+        exportedMetricPrefix,
         BuiltInMetricsConstant.GAX_METER_NAME,
         BuiltInMetricsConstant.OPERATION_COUNT_NAME,
         BuiltInMetricsConstant.OPERATION_COUNT_NAME,
@@ -233,20 +245,22 @@ public class BuiltInMetricsConstant {
         "1");
     defineView(
         views,
+        exportedMetricPrefix,
         BuiltInMetricsConstant.GAX_METER_NAME,
         BuiltInMetricsConstant.ATTEMPT_COUNT_NAME,
         BuiltInMetricsConstant.ATTEMPT_COUNT_NAME,
         Aggregation.sum(),
         InstrumentType.COUNTER,
         "1");
-    defineSpannerView(views);
-    defineGRPCView(views);
-    defineGrpcGcpView(views);
+    defineSpannerView(views, exportedMetricPrefix);
+    defineGRPCView(views, exportedMetricPrefix);
+    defineGrpcGcpView(views, exportedMetricPrefix);
     return views.build();
   }
 
   private static void defineView(
       ImmutableMap.Builder<InstrumentSelector, View> viewMap,
+      String exportedMetricPrefix,
       String meterName,
       String metricName,
       String metricViewName,
@@ -266,27 +280,79 @@ public class BuiltInMetricsConstant {
             .collect(Collectors.toSet());
     View view =
         View.builder()
-            .setName(BuiltInMetricsConstant.METER_NAME + '/' + metricViewName)
+            .setName(exportedMetricPrefix + '/' + metricViewName)
             .setAggregation(aggregation)
             .setAttributeFilter(attributesFilter)
             .build();
     viewMap.put(selector, view);
   }
 
-  private static void defineSpannerView(ImmutableMap.Builder<InstrumentSelector, View> viewMap) {
-    InstrumentSelector selector =
-        InstrumentSelector.builder()
-            .setMeterName(BuiltInMetricsConstant.SPANNER_METER_NAME)
-            .build();
+  private static void defineSpannerView(
+      ImmutableMap.Builder<InstrumentSelector, View> viewMap, String exportedMetricPrefix) {
     Set<String> attributesFilter =
         BuiltInMetricsConstant.COMMON_ATTRIBUTES.stream()
             .map(AttributeKey::getKey)
             .collect(Collectors.toSet());
-    View view = View.builder().setAttributeFilter(attributesFilter).build();
+    defineSpannerMetricView(
+        viewMap,
+        exportedMetricPrefix,
+        GFE_LATENCIES_NAME,
+        Aggregation.defaultAggregation(),
+        InstrumentType.HISTOGRAM,
+        "ms",
+        attributesFilter);
+    defineSpannerMetricView(
+        viewMap,
+        exportedMetricPrefix,
+        AFE_LATENCIES_NAME,
+        Aggregation.defaultAggregation(),
+        InstrumentType.HISTOGRAM,
+        "ms",
+        attributesFilter);
+    defineSpannerMetricView(
+        viewMap,
+        exportedMetricPrefix,
+        GFE_CONNECTIVITY_ERROR_NAME,
+        Aggregation.sum(),
+        InstrumentType.COUNTER,
+        "1",
+        attributesFilter);
+    defineSpannerMetricView(
+        viewMap,
+        exportedMetricPrefix,
+        AFE_CONNECTIVITY_ERROR_NAME,
+        Aggregation.sum(),
+        InstrumentType.COUNTER,
+        "1",
+        attributesFilter);
+  }
+
+  private static void defineSpannerMetricView(
+      ImmutableMap.Builder<InstrumentSelector, View> viewMap,
+      String exportedMetricPrefix,
+      String metricName,
+      Aggregation aggregation,
+      InstrumentType instrumentType,
+      String unit,
+      Set<String> attributesFilter) {
+    InstrumentSelector selector =
+        InstrumentSelector.builder()
+            .setName(BuiltInMetricsConstant.METER_NAME + '/' + metricName)
+            .setMeterName(BuiltInMetricsConstant.SPANNER_METER_NAME)
+            .setType(instrumentType)
+            .setUnit(unit)
+            .build();
+    View view =
+        View.builder()
+            .setName(exportedMetricPrefix + '/' + metricName)
+            .setAggregation(aggregation)
+            .setAttributeFilter(attributesFilter)
+            .build();
     viewMap.put(selector, view);
   }
 
-  private static void defineGRPCView(ImmutableMap.Builder<InstrumentSelector, View> viewMap) {
+  private static void defineGRPCView(
+      ImmutableMap.Builder<InstrumentSelector, View> viewMap, String exportedMetricPrefix) {
     for (String metric : BuiltInMetricsConstant.GRPC_METRICS_TO_ENABLE) {
       InstrumentSelector selector =
           InstrumentSelector.builder()
@@ -302,14 +368,15 @@ public class BuiltInMetricsConstant {
 
       View view =
           View.builder()
-              .setName(BuiltInMetricsConstant.METER_NAME + '/' + metric.replace(".", "/"))
+              .setName(exportedMetricPrefix + '/' + metric.replace(".", "/"))
               .setAttributeFilter(attributesFilter)
               .build();
       viewMap.put(selector, view);
     }
   }
 
-  private static void defineGrpcGcpView(ImmutableMap.Builder<InstrumentSelector, View> viewMap) {
+  private static void defineGrpcGcpView(
+      ImmutableMap.Builder<InstrumentSelector, View> viewMap, String exportedMetricPrefix) {
     for (String metric : GRPC_GCP_METRICS_TO_ENABLE) {
       InstrumentSelector selector =
           InstrumentSelector.builder()
@@ -327,7 +394,7 @@ public class BuiltInMetricsConstant {
 
       View view =
           View.builder()
-              .setName(BuiltInMetricsConstant.METER_NAME + '/' + metric.replace(".", "/"))
+              .setName(exportedMetricPrefix + '/' + metric.replace(".", "/"))
               .setAggregation(Aggregation.sum())
               .setAttributeFilter(attributesFilter)
               .build();

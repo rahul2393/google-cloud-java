@@ -2474,6 +2474,20 @@ public class SpannerOptions extends ServiceOptions<Spanner, SpannerOptions> {
     BuiltInMetricsConstant.getAllViews().forEach(meterProviderBuilder::registerView);
   }
 
+  /**
+   * Registers Spanner built-in metric views using custom-export-safe metric names on a caller-owned
+   * {@link SdkMeterProviderBuilder}.
+   *
+   * <p>Use this when exporting built-in metrics through a customer-owned exporter such as YCSB's
+   * Cloud Monitoring exporter. The emitted metric names keep Spanner semantics but avoid the
+   * reserved {@code spanner.googleapis.com/...} namespace.
+   */
+  @BetaApi
+  public static void registerBuiltInMetricViewsForCustomExporter(
+      SdkMeterProviderBuilder meterProviderBuilder) {
+    BuiltInMetricsConstant.getCustomExporterViews().forEach(meterProviderBuilder::registerView);
+  }
+
   /** Returns the internal OpenTelemetry instance used for built-in metrics. */
   @InternalApi
   public OpenTelemetry getBuiltInOpenTelemetry() {

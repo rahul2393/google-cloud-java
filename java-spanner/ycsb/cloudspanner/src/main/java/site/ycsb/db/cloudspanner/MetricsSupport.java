@@ -180,7 +180,7 @@ final class MetricsSupport {
                     .setInterval(Duration.ofSeconds(exportIntervalSeconds))
                     .build());
     if (isBuiltInMetricsExportEnabled(properties)) {
-      SpannerOptions.registerBuiltInMetricViews(sdkMeterProviderBuilder);
+      SpannerOptions.registerBuiltInMetricViewsForCustomExporter(sdkMeterProviderBuilder);
     }
     SdkMeterProvider sdkMeterProvider = sdkMeterProviderBuilder.build();
 
@@ -196,6 +196,11 @@ final class MetricsSupport {
             configuredExportIntervalSeconds,
             isBuiltInMetricsExportEnabled(properties)
         });
+    if (isBuiltInMetricsExportEnabled(properties)) {
+      LOGGER.log(
+          Level.INFO,
+          "Built-in metrics are using custom-export-compatible names under the configured prefix.");
+    }
     return openTelemetrySdk;
   }
 

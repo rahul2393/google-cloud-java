@@ -1213,6 +1213,38 @@ public class GapicSpannerRpcTest {
     }
   }
 
+  @Test
+  public void testBuiltInMetricsDisabledButExportToOpenTelemetryConfiguresGrpcBuiltInMetrics() {
+    try {
+      SpannerOptions.useEnvironment(
+          new SpannerOptions.SpannerEnvironment() {
+            @Override
+            public boolean isEnableGRPCBuiltInMetrics() {
+              return true;
+            }
+          });
+
+      OpenTelemetrySdk openTelemetry =
+          OpenTelemetrySdk.builder().setMeterProvider(SdkMeterProvider.builder().build()).build();
+      SpannerOptions options =
+          SpannerOptions.newBuilder()
+              .setProjectId("[PROJECT]")
+              .setCredentials(STATIC_CREDENTIALS)
+              .setBuiltInMetricsEnabled(false)
+              .setOpenTelemetry(openTelemetry)
+              .setExportBuiltInMetricsToOpenTelemetry(true)
+              .build();
+      InstantiatingGrpcChannelProvider.Builder channelProviderBuilder =
+          InstantiatingGrpcChannelProvider.newBuilder();
+
+      options.enablegRPCMetrics(channelProviderBuilder);
+
+      assertNotNull(channelProviderBuilder.getChannelConfigurator());
+    } finally {
+      SpannerOptions.useDefaultEnvironment();
+    }
+  }
+
   private static final class RecordingTransportChannelProvider implements TransportChannelProvider {
     private final String host;
     private final int port;

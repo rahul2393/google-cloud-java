@@ -39,6 +39,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
+import javax.annotation.Nullable;
 
 @InternalApi
 public final class KeyRecipeCache {
@@ -155,6 +156,11 @@ public final class KeyRecipeCache {
   }
 
   public void computeKeys(ReadRequest.Builder reqBuilder) {
+    computeKeys(reqBuilder, null);
+  }
+
+  RoutingPreparationStatus computeKeys(
+      ReadRequest.Builder reqBuilder, @Nullable RouteSelectionDebugInfo debugInfo) {
     long reqFp = fingerprint(reqBuilder.buildPartial());
 
     RoutingHint.Builder hintBuilder = reqBuilder.getRoutingHintBuilder();
@@ -167,7 +173,11 @@ public final class KeyRecipeCache {
       preparedReads.put(reqFp, preparedRead);
     } else if (!preparedRead.matches(reqBuilder.buildPartial())) {
       logger.fine("Fingerprint collision for ReadRequest: " + reqFp);
-      return;
+      if (debugInfo != null) {
+        debugInfo.setDefaultReason(
+            "read_request_fingerprint_collision", "prepared read fingerprint collision");
+      }
+      return RoutingPreparationStatus.FINGERPRINT_COLLISION;
     }
 
     hintBuilder.setOperationUid(preparedRead.operationUid);
@@ -179,18 +189,36 @@ public final class KeyRecipeCache {
     KeyRecipe recipe = getIfPresent(schemaRecipes, recipeKey);
     if (recipe == null) {
       logger.fine("Schema recipe not found for: " + recipeKey);
-      return;
+      if (debugInfo != null) {
+        debugInfo.setDefaultReason("schema_recipe_missing", "recipe key=" + recipeKey);
+      }
+      return RoutingPreparationStatus.SCHEMA_RECIPE_MISSING;
     }
 
     try {
       TargetRange target = recipe.keySetToTargetRange(reqBuilder.getKeySet());
       applyTargetRange(hintBuilder, target);
+      if (debugInfo != null) {
+        debugInfo.captureRoutingHint(hintBuilder);
+      }
+      return hintBuilder.getKey().isEmpty()
+          ? RoutingPreparationStatus.EMPTY_ROUTING_KEY
+          : RoutingPreparationStatus.OK;
     } catch (IllegalArgumentException e) {
       logger.fine("Failed key encoding: " + e.getMessage());
+      if (debugInfo != null) {
+        debugInfo.setDefaultReason("read_key_encoding_failed", e.getMessage());
+      }
+      return RoutingPreparationStatus.KEY_ENCODING_FAILED;
     }
   }
 
   public void computeKeys(ExecuteSqlRequest.Builder reqBuilder) {
+    computeKeys(reqBuilder, null);
+  }
+
+  RoutingPreparationStatus computeKeys(
+      ExecuteSqlRequest.Builder reqBuilder, @Nullable RouteSelectionDebugInfo debugInfo) {
     long reqFp = fingerprint(reqBuilder.buildPartial());
 
     RoutingHint.Builder hintBuilder = reqBuilder.getRoutingHintBuilder();
@@ -203,20 +231,38 @@ public final class KeyRecipeCache {
       preparedQueries.put(reqFp, preparedQuery);
     } else if (!preparedQuery.matches(reqBuilder.buildPartial())) {
       logger.fine("Fingerprint collision for ExecuteSqlRequest: " + reqFp);
-      return;
+      if (debugInfo != null) {
+        debugInfo.setDefaultReason(
+            "query_request_fingerprint_collision", "prepared query fingerprint collision");
+      }
+      return RoutingPreparationStatus.FINGERPRINT_COLLISION;
     }
 
     hintBuilder.setOperationUid(preparedQuery.operationUid);
     KeyRecipe recipe = getIfPresent(queryRecipes, preparedQuery.operationUid);
     if (recipe == null) {
-      return;
+      if (debugInfo != null) {
+        debugInfo.setDefaultReason(
+            "query_recipe_missing", "operation_uid=" + preparedQuery.operationUid);
+      }
+      return RoutingPreparationStatus.QUERY_RECIPE_MISSING;
     }
 
     try {
       TargetRange target = recipe.queryParamsToTargetRange(reqBuilder.getParams());
       applyTargetRange(hintBuilder, target);
+      if (debugInfo != null) {
+        debugInfo.captureRoutingHint(hintBuilder);
+      }
+      return hintBuilder.getKey().isEmpty()
+          ? RoutingPreparationStatus.EMPTY_ROUTING_KEY
+          : RoutingPreparationStatus.OK;
     } catch (IllegalArgumentException e) {
       logger.fine("Failed query param encoding: " + e.getMessage());
+      if (debugInfo != null) {
+        debugInfo.setDefaultReason("query_param_encoding_failed", e.getMessage());
+      }
+      return RoutingPreparationStatus.KEY_ENCODING_FAILED;
     }
   }
 
@@ -234,17 +280,31 @@ public final class KeyRecipeCache {
   }
 
   public TargetRange mutationToTargetRange(Mutation mutation) {
+    return mutationToTargetRange(mutation, null);
+  }
+
+  public TargetRange mutationToTargetRange(
+      Mutation mutation, @Nullable RouteSelectionDebugInfo debugInfo) {
     if (mutation == null) {
+      if (debugInfo != null) {
+        debugInfo.setDefaultReason("mutation_missing", "mutation unavailable for routing");
+      }
       return null;
     }
     String tableName = tableNameFromMutation(mutation);
     if (tableName == null || tableName.isEmpty()) {
+      if (debugInfo != null) {
+        debugInfo.setDefaultReason("mutation_table_missing", "mutation has no routable table");
+      }
       return null;
     }
 
     KeyRecipe recipe = getIfPresent(schemaRecipes, tableName);
     if (recipe == null) {
       logger.fine("Schema recipe not found for mutation table: " + tableName);
+      if (debugInfo != null) {
+        debugInfo.setDefaultReason("mutation_schema_recipe_missing", "table=" + tableName);
+      }
       return null;
     }
 
@@ -252,8 +312,20 @@ public final class KeyRecipeCache {
       return recipe.mutationToTargetRange(mutation);
     } catch (IllegalArgumentException e) {
       logger.fine("Failed mutation key encoding: " + e.getMessage());
+      if (debugInfo != null) {
+        debugInfo.setDefaultReason("mutation_key_encoding_failed", e.getMessage());
+      }
       return null;
     }
+  }
+
+  enum RoutingPreparationStatus {
+    OK,
+    EMPTY_ROUTING_KEY,
+    SCHEMA_RECIPE_MISSING,
+    QUERY_RECIPE_MISSING,
+    KEY_ENCODING_FAILED,
+    FINGERPRINT_COLLISION
   }
 
   private static String tableNameFromMutation(Mutation mutation) {

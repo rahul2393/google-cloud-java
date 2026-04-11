@@ -87,6 +87,7 @@ import io.opencensus.trace.Tracing;
 import io.opentelemetry.api.GlobalOpenTelemetry;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.sdk.OpenTelemetrySdk;
 import java.io.File;
 import java.io.IOException;
 import java.net.MalformedURLException;
@@ -110,6 +111,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
+import io.opentelemetry.sdk.metrics.SdkMeterProviderBuilder;
 
 /** Options for the Cloud Spanner service. */
 public class SpannerOptions extends ServiceOptions<Spanner, SpannerOptions> {
@@ -302,6 +304,7 @@ public class SpannerOptions extends ServiceOptions<Spanner, SpannerOptions> {
   private final OpenTelemetry openTelemetry;
   private final boolean enableApiTracing;
   private final boolean enableBuiltInMetrics;
+  private final boolean exportBuiltInMetricsToOpenTelemetry;
   private final boolean enableLocationApi;
   private final boolean enableExtendedTracing;
   private final boolean enableEndToEndTracing;
@@ -976,6 +979,7 @@ public class SpannerOptions extends ServiceOptions<Spanner, SpannerOptions> {
     openTelemetry = builder.openTelemetry;
     enableApiTracing = builder.enableApiTracing;
     enableExtendedTracing = builder.enableExtendedTracing;
+    exportBuiltInMetricsToOpenTelemetry = builder.exportBuiltInMetricsToOpenTelemetry;
     if (builder.experimentalHost != null) {
       enableBuiltInMetrics = false;
     } else {
@@ -1248,6 +1252,7 @@ public class SpannerOptions extends ServiceOptions<Spanner, SpannerOptions> {
     private boolean enableExtendedTracing = SpannerOptions.environment.isEnableExtendedTracing();
     private boolean enableEndToEndTracing = SpannerOptions.environment.isEnableEndToEndTracing();
     private boolean enableBuiltInMetrics = SpannerOptions.environment.isEnableBuiltInMetrics();
+    private boolean exportBuiltInMetricsToOpenTelemetry = false;
     private boolean enableLocationApi = SpannerOptions.environment.isEnableLocationApi();
     private String monitoringHost = SpannerOptions.environment.getMonitoringHost();
     private SslContext mTLSContext = null;
@@ -1356,6 +1361,7 @@ public class SpannerOptions extends ServiceOptions<Spanner, SpannerOptions> {
       this.enableApiTracing = options.enableApiTracing;
       this.enableExtendedTracing = options.enableExtendedTracing;
       this.enableBuiltInMetrics = options.enableBuiltInMetrics;
+      this.exportBuiltInMetricsToOpenTelemetry = options.exportBuiltInMetricsToOpenTelemetry;
       this.enableLocationApi = options.enableLocationApi;
       this.enableEndToEndTracing = options.enableEndToEndTracing;
       this.monitoringHost = options.monitoringHost;
@@ -2022,6 +2028,24 @@ public class SpannerOptions extends ServiceOptions<Spanner, SpannerOptions> {
       return this;
     }
 
+    /**
+     * Enables exporting Spanner built-in metrics to the {@link OpenTelemetry} configured with
+     * {@link #setOpenTelemetry(OpenTelemetry)}. When built-in metrics are also enabled, the
+     * metrics are exported both to the default built-in Cloud Monitoring exporter and to the
+     * caller-provided {@link OpenTelemetry}. When built-in metrics are disabled, this option keeps
+     * built-in metric recording enabled only for the caller-provided {@link OpenTelemetry}.
+     *
+     * <p>To preserve the built-in metric names and views on a custom {@link OpenTelemetrySdk}, the
+     * caller should register the built-in views with
+     * {@link SpannerOptions#registerBuiltInMetricViews(SdkMeterProviderBuilder)} before building
+     * the SDK.
+     */
+    public Builder setExportBuiltInMetricsToOpenTelemetry(
+        boolean exportBuiltInMetricsToOpenTelemetry) {
+      this.exportBuiltInMetricsToOpenTelemetry = exportBuiltInMetricsToOpenTelemetry;
+      return this;
+    }
+
     /** Sets the monitoring host to be used for Built-in client side metrics */
     @Deprecated
     @ObsoleteApi(
@@ -2438,6 +2462,18 @@ public class SpannerOptions extends ServiceOptions<Spanner, SpannerOptions> {
     return createApiTracerFactory(false, false);
   }
 
+  /**
+   * Registers the Spanner built-in metric views on a caller-owned {@link SdkMeterProviderBuilder}.
+   *
+   * <p>This is useful when you want built-in metrics to be emitted through a custom
+   * {@link OpenTelemetry} instance while preserving the built-in metric names, attributes, and
+   * histogram aggregation.
+   */
+  @BetaApi
+  public static void registerBuiltInMetricViews(SdkMeterProviderBuilder meterProviderBuilder) {
+    BuiltInMetricsConstant.getAllViews().forEach(meterProviderBuilder::registerView);
+  }
+
   /** Returns the internal OpenTelemetry instance used for built-in metrics. */
   @InternalApi
   public OpenTelemetry getBuiltInOpenTelemetry() {
@@ -2446,13 +2482,21 @@ public class SpannerOptions extends ServiceOptions<Spanner, SpannerOptions> {
   }
 
   public void enablegRPCMetrics(InstantiatingGrpcChannelProvider.Builder channelProviderBuilder) {
-    if (isEnableBuiltInMetrics() && SpannerOptions.environment.isEnableGRPCBuiltInMetrics()) {
+    if (!SpannerOptions.environment.isEnableGRPCBuiltInMetrics()) {
+      return;
+    }
+    if (isEnableBuiltInMetrics()) {
       this.builtInMetricsProvider.enableGrpcMetrics(
           channelProviderBuilder,
           this.getProjectId(),
           getCredentials(),
           this.monitoringHost,
           getUniverseDomain());
+      return;
+    }
+    if (exportBuiltInMetricsToOpenTelemetry && getOpenTelemetry() instanceof OpenTelemetrySdk) {
+      this.builtInMetricsProvider.enableGrpcMetrics(
+          channelProviderBuilder, (OpenTelemetrySdk) getOpenTelemetry());
     }
   }
 
@@ -2467,9 +2511,13 @@ public class SpannerOptions extends ServiceOptions<Spanner, SpannerOptions> {
     apiTracerFactories.add(
         MoreObjects.firstNonNull(super.getApiTracerFactory(), getDefaultApiTracerFactory()));
 
-    // Add Metrics Tracer factory if built in metrics are enabled and if the client is data client
-    // and if emulator is not enabled.
-    if (isEnableBuiltInMetrics() && !isAdminClient && !isEmulatorEnabled && !usesNoCredentials()) {
+    // Add Metrics Tracer factory if built-in metrics are enabled for the internal exporter or if
+    // they should be exported to caller-provided OpenTelemetry. Skip for admin, emulator, or
+    // credential-less clients.
+    if ((isEnableBuiltInMetrics() || exportBuiltInMetricsToOpenTelemetry)
+        && !isAdminClient
+        && !isEmulatorEnabled
+        && !usesNoCredentials()) {
       ApiTracerFactory metricsTracerFactory = createMetricsApiTracerFactory();
       if (metricsTracerFactory != null) {
         apiTracerFactories.add(metricsTracerFactory);
@@ -2496,23 +2544,50 @@ public class SpannerOptions extends ServiceOptions<Spanner, SpannerOptions> {
   }
 
   private ApiTracerFactory createMetricsApiTracerFactory() {
-    OpenTelemetry openTelemetry =
-        this.builtInMetricsProvider.getOrCreateOpenTelemetry(
-            this.getProjectId(), getCredentials(), this.monitoringHost, getUniverseDomain());
+    List<ApiTracerFactory> tracerFactories = new ArrayList<>();
+    if (isEnableBuiltInMetrics()) {
+      OpenTelemetry builtInOpenTelemetry =
+          this.builtInMetricsProvider.getOrCreateOpenTelemetry(
+              this.getProjectId(), getCredentials(), this.monitoringHost, getUniverseDomain());
+      if (builtInOpenTelemetry != null) {
+        tracerFactories.add(
+            new BuiltInMetricsTracerFactory(
+                new BuiltInMetricsRecorder(builtInOpenTelemetry, BuiltInMetricsConstant.METER_NAME),
+                new HashMap<>(),
+                new TraceWrapper(
+                    Tracing.getTracer(),
+                    // Using the OpenTelemetry object set in Spanner Options, will be NoOp if not
+                    // set
+                    this.getOpenTelemetry()
+                        .getTracer(
+                            MetricRegistryConstants.INSTRUMENTATION_SCOPE,
+                            GaxProperties.getLibraryVersion(getClass())),
+                    true)));
+      }
+    }
 
-    return openTelemetry != null
-        ? new BuiltInMetricsTracerFactory(
-            new BuiltInMetricsRecorder(openTelemetry, BuiltInMetricsConstant.METER_NAME),
-            new HashMap<>(),
-            new TraceWrapper(
-                Tracing.getTracer(),
-                // Using the OpenTelemetry object set in Spanner Options, will be NoOp if not set
-                this.getOpenTelemetry()
-                    .getTracer(
-                        MetricRegistryConstants.INSTRUMENTATION_SCOPE,
-                        GaxProperties.getLibraryVersion(getClass())),
-                true))
-        : null;
+    if (exportBuiltInMetricsToOpenTelemetry) {
+      tracerFactories.add(
+          new BuiltInMetricsTracerFactory(
+              new BuiltInMetricsRecorder(
+                  this.getOpenTelemetry(), BuiltInMetricsConstant.METER_NAME),
+              new HashMap<>(),
+              new TraceWrapper(
+                  Tracing.getTracer(),
+                  this.getOpenTelemetry()
+                      .getTracer(
+                          MetricRegistryConstants.INSTRUMENTATION_SCOPE,
+                          GaxProperties.getLibraryVersion(getClass())),
+                  true)));
+    }
+
+    if (tracerFactories.isEmpty()) {
+      return null;
+    }
+
+    return tracerFactories.size() == 1
+        ? tracerFactories.get(0)
+        : new CompositeTracerFactory(tracerFactories);
   }
 
   /**
@@ -2530,6 +2605,11 @@ public class SpannerOptions extends ServiceOptions<Spanner, SpannerOptions> {
    */
   public boolean isEnableBuiltInMetrics() {
     return enableBuiltInMetrics;
+  }
+
+  /** Returns whether built-in metrics are also exported to {@link #getOpenTelemetry()}. */
+  public boolean isExportBuiltInMetricsToOpenTelemetry() {
+    return exportBuiltInMetricsToOpenTelemetry;
   }
 
   @InternalApi

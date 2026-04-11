@@ -23,6 +23,7 @@ import com.google.api.gax.tracing.ApiTracer;
 import com.google.api.gax.tracing.BaseApiTracer;
 import com.google.api.gax.tracing.MetricsTracer;
 import com.google.common.collect.ImmutableList;
+import io.opentelemetry.api.trace.Span;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -200,5 +201,14 @@ public class CompositeTracer extends BaseApiTracer {
                 gfeLatency, afeLatency, isDirectPathUsed, isAfeEnabled);
       }
     }
+  }
+
+  public Span getOpenTelemetrySpan() {
+    for (ApiTracer child : children) {
+      if (child instanceof OpenTelemetryApiTracer) {
+        return ((OpenTelemetryApiTracer) child).getSpan();
+      }
+    }
+    return Span.getInvalid();
   }
 }

@@ -382,6 +382,8 @@ public class CloudSpannerClient extends DB {
           .append(MetricsSupport.getConfiguredMetricPrefix())
           .append("\nOTEL service name: ")
           .append(MetricsSupport.getConfiguredServiceName())
+          .append("\nExport Spanner built-in metrics to OTEL: ")
+          .append(MetricsSupport.isBuiltInMetricsExportEnabled())
           .append("\nTracing enabled: ")
           .append(TracingSupport.isEnabled())
           .append("\nTracing project: ")
@@ -394,6 +396,7 @@ public class CloudSpannerClient extends DB {
 
   private Status readUsingQuery(
       String table, String key, Set<String> fields, Map<String, ByteIterator> result) {
+    annotateReadSpan(Span.current(), key, true);
     Statement query;
     Iterable<String> columns = fields == null ? STANDARD_FIELDS : fields;
     if (fields == null || fields.size() == fieldCount) {
@@ -430,6 +433,7 @@ public class CloudSpannerClient extends DB {
     Status status = Status.ERROR;
     Throwable error = null;
     try (Scope scope = TracingSupport.makeCurrent(span)) {
+      annotateReadSpan(span, key, queriesForReads);
       if (queriesForReads) {
         status = readUsingQuery(table, key, fields, result);
         return status;
@@ -448,6 +452,17 @@ public class CloudSpannerClient extends DB {
     } finally {
       TracingSupport.finishSpan(span, status, error, startNanos);
     }
+  }
+
+  private void annotateReadSpan(Span span, String key, boolean queryMode) {
+    if (span == null) {
+      return;
+    }
+    span.setAttribute("ycsb.key", key);
+    span.setAttribute("ycsb.read.mode", queryMode ? "query" : "read");
+    span.setAttribute("ycsb.read.consistency", timestampBound.getMode().name().toLowerCase());
+    span.setAttribute(
+        "ycsb.read.strong", timestampBound.getMode() == TimestampBound.Mode.STRONG);
   }
 
   private Status scanUsingQuery(

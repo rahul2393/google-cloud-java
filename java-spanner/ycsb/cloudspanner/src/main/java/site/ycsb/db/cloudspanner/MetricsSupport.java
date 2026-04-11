@@ -23,6 +23,7 @@ import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.metrics.SdkMeterProviderBuilder;
 import io.opentelemetry.sdk.metrics.export.MetricExporter;
 import io.opentelemetry.sdk.metrics.export.PeriodicMetricReader;
 import io.opentelemetry.sdk.resources.Resource;
@@ -41,6 +42,10 @@ final class MetricsSupport {
   private static final String ENV_METRICS_PREFIX = "OTEL_METRIC_PREFIX";
   private static final String PROP_SERVICE_NAME = "cloudspanner.grpcgcp.metrics.service";
   private static final String ENV_SERVICE_NAME = "OTEL_SERVICE_NAME";
+  private static final String PROP_EXPORT_BUILTIN_METRICS =
+      "cloudspanner.metrics.export.builtin.to.otel";
+  private static final String ENV_EXPORT_BUILTIN_METRICS =
+      "YCSB_EXPORT_SPANNER_BUILTIN_METRICS_TO_OTEL";
   private static final String PROP_EXPORT_INTERVAL_SECONDS =
       "cloudspanner.grpcgcp.metrics.export.interval.seconds";
   private static final String ENV_EXPORT_INTERVAL_SECONDS =
@@ -57,22 +62,31 @@ final class MetricsSupport {
   private static volatile String configuredProjectId = "<disabled>";
   private static volatile String configuredMetricPrefix = "<disabled>";
   private static volatile String configuredServiceName = "<disabled>";
+  private static volatile boolean exportBuiltInMetricsToOpenTelemetry;
 
   private MetricsSupport() {}
 
   static void configureSpannerOptions(SpannerOptions.Builder optionsBuilder, Properties properties) {
     if (!isEnabled(properties)) {
       enabled = false;
+      exportBuiltInMetricsToOpenTelemetry = false;
       return;
     }
 
     OpenTelemetrySdk sdk = getOrCreateSdk(properties);
     if (sdk == null) {
       enabled = false;
+      exportBuiltInMetricsToOpenTelemetry = false;
       return;
     }
 
     optionsBuilder.setOpenTelemetry(sdk);
+    if (isBuiltInMetricsExportEnabled(properties)) {
+      optionsBuilder.setExportBuiltInMetricsToOpenTelemetry(true);
+      exportBuiltInMetricsToOpenTelemetry = true;
+    } else {
+      exportBuiltInMetricsToOpenTelemetry = false;
+    }
     enabled = true;
   }
 
@@ -90,6 +104,10 @@ final class MetricsSupport {
 
   static String getConfiguredServiceName() {
     return configuredServiceName;
+  }
+
+  static boolean isBuiltInMetricsExportEnabled() {
+    return exportBuiltInMetricsToOpenTelemetry;
   }
 
   static void shutdown() {
@@ -141,14 +159,17 @@ final class MetricsSupport {
             .build();
     MetricExporter metricExporter = GoogleCloudMetricExporter.createWithConfiguration(metricConfig);
 
-    SdkMeterProvider sdkMeterProvider =
+    SdkMeterProviderBuilder sdkMeterProviderBuilder =
         SdkMeterProvider.builder()
             .setResource(resource)
             .registerMetricReader(
                 PeriodicMetricReader.builder(metricExporter)
                     .setInterval(Duration.ofSeconds(exportIntervalSeconds))
-                    .build())
-            .build();
+                    .build());
+    if (isBuiltInMetricsExportEnabled(properties)) {
+      SpannerOptions.registerBuiltInMetricViews(sdkMeterProviderBuilder);
+    }
+    SdkMeterProvider sdkMeterProvider = sdkMeterProviderBuilder.build();
 
     openTelemetrySdk = OpenTelemetrySdk.builder().setMeterProvider(sdkMeterProvider).build();
     return openTelemetrySdk;
@@ -157,6 +178,11 @@ final class MetricsSupport {
   private static boolean isEnabled(Properties properties) {
     return Boolean.parseBoolean(
         getString(properties, PROP_METRICS_ENABLED, ENV_METRICS_ENABLED, "false"));
+  }
+
+  private static boolean isBuiltInMetricsExportEnabled(Properties properties) {
+    return Boolean.parseBoolean(
+        getString(properties, PROP_EXPORT_BUILTIN_METRICS, ENV_EXPORT_BUILTIN_METRICS, "false"));
   }
 
   private static int getInt(

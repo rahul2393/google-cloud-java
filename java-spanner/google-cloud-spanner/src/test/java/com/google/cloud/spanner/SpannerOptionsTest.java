@@ -29,6 +29,9 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.mock;
 
+import com.google.api.gax.tracing.ApiTracer;
+import com.google.api.gax.tracing.ApiTracerFactory;
+import com.google.api.gax.tracing.SpanName;
 import com.google.api.gax.grpc.GrpcCallContext;
 import com.google.api.gax.retrying.RetrySettings;
 import com.google.api.gax.rpc.ApiCallContext;
@@ -68,9 +71,12 @@ import io.opentelemetry.api.GlobalOpenTelemetry;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.metrics.SdkMeterProviderBuilder;
 import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
+import io.opentelemetry.sdk.metrics.data.MetricData;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -148,6 +154,60 @@ public class SpannerOptionsTest {
     assertThat(options.getPrefetchChunks()).isEqualTo(2);
     assertThat(options.getSessionLabels()).containsExactlyEntriesIn(labels);
     assertThat(options.getOpenTelemetry()).isEqualTo(openTelemetry);
+  }
+
+  @Test
+  public void builderCanEnableBuiltInMetricsExportToOpenTelemetry() {
+    SpannerOptions options =
+        SpannerOptions.newBuilder()
+            .setProjectId("test-project")
+            .setCredentials(NoCredentials.getInstance())
+            .setExportBuiltInMetricsToOpenTelemetry(true)
+            .build();
+
+    assertTrue(options.isExportBuiltInMetricsToOpenTelemetry());
+  }
+
+  @Test
+  public void builtInMetricsCanBeExportedToInjectedOpenTelemetryWhenInternalExporterDisabled() {
+    InMemoryMetricReader inMemoryMetricReader = InMemoryMetricReader.create();
+    SdkMeterProviderBuilder meterProviderBuilder =
+        SdkMeterProvider.builder().registerMetricReader(inMemoryMetricReader);
+    SpannerOptions.registerBuiltInMetricViews(meterProviderBuilder);
+    OpenTelemetry openTelemetry =
+        OpenTelemetrySdk.builder().setMeterProvider(meterProviderBuilder.build()).build();
+
+    SpannerOptions options =
+        SpannerOptions.newBuilder()
+            .setProjectId("test-project")
+            .setBuiltInMetricsEnabled(false)
+            .setCredentials(mock(com.google.auth.Credentials.class))
+            .setOpenTelemetry(openTelemetry)
+            .setExportBuiltInMetricsToOpenTelemetry(true)
+            .build();
+
+    ApiTracer tracer =
+        options
+            .getApiTracerFactory()
+            .newTracer(null, SpanName.of("Spanner", "ExecuteSql"), ApiTracerFactory.OperationType.Unary);
+
+    tracer.attemptStarted(null, 0);
+    tracer.requestSent();
+    tracer.responseReceived();
+    tracer.attemptSucceeded();
+    tracer.operationSucceeded();
+
+    MetricData operationCountMetric =
+        getMetricData(
+            inMemoryMetricReader,
+            BuiltInMetricsConstant.METER_NAME + "/" + BuiltInMetricsConstant.OPERATION_COUNT_NAME);
+    assertNotNull(operationCountMetric);
+    assertFalse(operationCountMetric.getLongSumData().getPoints().isEmpty());
+  }
+
+  private MetricData getMetricData(InMemoryMetricReader reader, String metricName) {
+    Collection<MetricData> metrics = reader.collectAllMetrics();
+    return metrics.stream().filter(metric -> metric.getName().equals(metricName)).findFirst().orElse(null);
   }
 
   @Test

@@ -580,6 +580,9 @@ public class GapicSpannerRpc implements SpannerRpc {
         return builtInOtel;
       }
     }
+    if (options.isExportBuiltInMetricsToOpenTelemetry()) {
+      return options.getOpenTelemetry();
+    }
     return OpenTelemetry.noop();
   }
 

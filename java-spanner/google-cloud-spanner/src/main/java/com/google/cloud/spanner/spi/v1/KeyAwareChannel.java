@@ -42,10 +42,12 @@ import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.common.AttributesBuilder;
 import io.opentelemetry.api.trace.Span;
 import java.io.IOException;
 import java.lang.ref.ReferenceQueue;
 import java.lang.ref.SoftReference;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
@@ -89,6 +91,8 @@ final class KeyAwareChannel extends ManagedChannel {
   private final ReferenceQueue<ChannelFinder> channelFinderReferenceQueue = new ReferenceQueue<>();
   private final Map<String, ChannelFinderReference> channelFinders = new ConcurrentHashMap<>();
   private final Map<ByteString, String> transactionAffinities = new ConcurrentHashMap<>();
+  private final RouteDecisionSummaryLogger routeDecisionSummaryLogger =
+      new RouteDecisionSummaryLogger();
   // Maps read-only transaction IDs to their preferLeader value.
   // Strong reads → true (prefer leader), Stale reads → false (any replica).
   // Bounded to prevent unbounded growth if application code does not close read-only transactions.
@@ -171,8 +175,8 @@ final class KeyAwareChannel extends ManagedChannel {
         if (finder == null) {
           finder =
               lifecycleManager != null
-                  ? new ChannelFinder(endpointCache, lifecycleManager)
-                  : new ChannelFinder(endpointCache);
+                  ? new ChannelFinder(endpointCache, lifecycleManager, routeDecisionSummaryLogger)
+                  : new ChannelFinder(endpointCache, null, routeDecisionSummaryLogger);
           channelFinders.put(
               databaseId,
               new ChannelFinderReference(databaseId, finder, channelFinderReferenceQueue));
@@ -319,6 +323,7 @@ final class KeyAwareChannel extends ManagedChannel {
     }
     String address = endpoint.getAddress();
     if (!defaultEndpointAddress.equals(address)) {
+      routeDecisionSummaryLogger.recordResourceExhaustedExclusion(address);
       excludedEndpointsForLogicalRequest
           .asMap()
           .compute(
@@ -332,18 +337,16 @@ final class KeyAwareChannel extends ManagedChannel {
     }
   }
 
-  private Predicate<String> consumeExcludedEndpointsForCurrentCall(
-      @Nullable String logicalRequestKey) {
+  private Set<String> consumeExcludedEndpointsForCurrentCall(@Nullable String logicalRequestKey) {
     if (logicalRequestKey == null) {
-      return address -> false;
+      return Collections.emptySet();
     }
     Set<String> excludedEndpoints =
         excludedEndpointsForLogicalRequest.asMap().remove(logicalRequestKey);
     if (excludedEndpoints == null || excludedEndpoints.isEmpty()) {
-      return address -> false;
+      return Collections.emptySet();
     }
-    excludedEndpoints = new HashSet<>(excludedEndpoints);
-    return excludedEndpoints::contains;
+    return new HashSet<>(excludedEndpoints);
   }
 
   private boolean isReadOnlyTransaction(ByteString transactionId) {
@@ -414,7 +417,8 @@ final class KeyAwareChannel extends ManagedChannel {
       MethodDescriptor<?, ?> methodDescriptor,
       String target,
       boolean usedDefaultEndpoint,
-      boolean hasChannelFinder) {
+      boolean hasChannelFinder,
+      @Nullable RouteSelectionDebugInfo debugInfo) {
     Span span = Span.current();
     if (!span.getSpanContext().isValid()) {
       return;
@@ -423,14 +427,120 @@ final class KeyAwareChannel extends ManagedChannel {
     span.setAttribute("spanner.route.used_default_endpoint", usedDefaultEndpoint);
     span.setAttribute("spanner.route.has_channel_finder", hasChannelFinder);
     span.setAttribute("spanner.route.method", methodDescriptor.getFullMethodName());
-    span.addEvent(
-        "spanner.route.selected",
+    if (debugInfo != null) {
+      if (debugInfo.getRangeLookupDurationMs() != null) {
+        span.addEvent(
+            "spanner.route.range_lookup.done",
+            Attributes.builder()
+                .put("spanner.route.range_lookup.duration_ms", debugInfo.getRangeLookupDurationMs())
+                .build());
+      }
+      if (debugInfo.getTabletSelectionDurationMs() != null) {
+        AttributesBuilder tabletSelectionAttributes =
+            Attributes.builder()
+                .put(
+                    "spanner.route.tablet_selection.duration_ms",
+                    debugInfo.getTabletSelectionDurationMs());
+        putIfPresent(
+            tabletSelectionAttributes,
+            "spanner.route.tablet_selection.matched_tablets",
+            debugInfo.getMatchedTabletCount());
+        putIfPresent(
+            tabletSelectionAttributes,
+            "spanner.route.tablet_selection.replica_filtered",
+            debugInfo.getReplicaFilteredCount());
+        putIfPresent(
+            tabletSelectionAttributes,
+            "spanner.route.tablet_selection.server_skip",
+            debugInfo.getServerSkipCount());
+        putIfPresent(
+            tabletSelectionAttributes,
+            "spanner.route.tablet_selection.empty_address",
+            debugInfo.getEmptyAddressCount());
+        putIfPresent(
+            tabletSelectionAttributes,
+            "spanner.route.tablet_selection.excluded_endpoint",
+            debugInfo.getExcludedEndpointCount());
+        putIfPresent(
+            tabletSelectionAttributes,
+            "spanner.route.tablet_selection.transient_failure",
+            debugInfo.getTransientFailureCount());
+        putIfPresent(
+            tabletSelectionAttributes,
+            "spanner.route.tablet_selection.endpoint_not_ready",
+            debugInfo.getEndpointNotReadyCount());
+        putIfPresent(
+            tabletSelectionAttributes,
+            "spanner.route.tablet_selection.selected",
+            debugInfo.getTabletSelected());
+        span.addEvent("spanner.route.tablet_selection.done", tabletSelectionAttributes.build());
+      }
+      if (debugInfo.getRouteSource() != null) {
+        span.setAttribute("spanner.route.source", debugInfo.getRouteSource());
+      }
+      if (debugInfo.getDefaultReasonCode() != null) {
+        span.setAttribute("spanner.route.default_reason", debugInfo.getDefaultReasonCode());
+      }
+      if (debugInfo.getDefaultReasonDetail() != null) {
+        span.setAttribute(
+            "spanner.route.default_reason_detail", debugInfo.getDefaultReasonDetail());
+      }
+      if (debugInfo.getDatabaseId() != null) {
+        span.setAttribute("spanner.route.database_id", debugInfo.getDatabaseId());
+      }
+      if (debugInfo.getRequestKeyHex() != null) {
+        span.setAttribute("spanner.route.request_key_hex", debugInfo.getRequestKeyHex());
+      }
+      if (debugInfo.getRequestLimitKeyHex() != null) {
+        span.setAttribute("spanner.route.request_limit_key_hex", debugInfo.getRequestLimitKeyHex());
+      }
+    }
+    AttributesBuilder eventAttributes =
         Attributes.builder()
             .put("spanner.target", target)
             .put("spanner.route.used_default_endpoint", usedDefaultEndpoint)
             .put("spanner.route.has_channel_finder", hasChannelFinder)
-            .put("spanner.route.method", methodDescriptor.getFullMethodName())
-            .build());
+            .put("spanner.route.method", methodDescriptor.getFullMethodName());
+    if (debugInfo != null) {
+      putIfPresent(eventAttributes, "spanner.route.source", debugInfo.getRouteSource());
+      putIfPresent(
+          eventAttributes, "spanner.route.default_reason", debugInfo.getDefaultReasonCode());
+      putIfPresent(
+          eventAttributes,
+          "spanner.route.default_reason_detail",
+          debugInfo.getDefaultReasonDetail());
+      putIfPresent(eventAttributes, "spanner.route.database_id", debugInfo.getDatabaseId());
+      putIfPresent(eventAttributes, "spanner.route.request_key_hex", debugInfo.getRequestKeyHex());
+      putIfPresent(
+          eventAttributes,
+          "spanner.route.request_limit_key_hex",
+          debugInfo.getRequestLimitKeyHex());
+    }
+    span.addEvent("spanner.route.selected", eventAttributes.build());
+    if (usedDefaultEndpoint && debugInfo != null && debugInfo.getDefaultReasonCode() != null) {
+      span.addEvent("spanner.route.default_endpoint_selected", eventAttributes.build());
+    }
+  }
+
+  private static void putIfPresent(
+      AttributesBuilder attributesBuilder, String key, @Nullable String value) {
+    if (value != null) {
+      attributesBuilder.put(key, value);
+    }
+  }
+
+  private static void putIfPresent(
+      AttributesBuilder attributesBuilder, String key, @Nullable Integer value) {
+    if (value != null) {
+      attributesBuilder.put(key, value.longValue());
+    }
+  }
+
+  private static void putIfPresent(
+      AttributesBuilder attributesBuilder, String key, @Nullable Boolean value) {
+    if (value != null) {
+      attributesBuilder.put(key, value);
+    }
   }
 
   static final class KeyAwareClientCall<RequestT, ResponseT>
@@ -444,6 +554,7 @@ final class KeyAwareChannel extends ManagedChannel {
     @Nullable private ClientCall<RequestT, ResponseT> delegate;
     private ChannelFinder channelFinder;
     @Nullable private Predicate<String> excludedEndpoints;
+    @Nullable private Set<String> excludedEndpointAddresses;
     @Nullable private ChannelEndpoint selectedEndpoint;
     @Nullable private ByteString transactionIdToClear;
     private boolean allowDefaultAffinity;
@@ -511,18 +622,19 @@ final class KeyAwareChannel extends ManagedChannel {
         Predicate<String> excludedEndpoints = excludedEndpoints();
         ChannelEndpoint endpoint = null;
         ChannelFinder finder = null;
+        RouteSelectionDebugInfo debugInfo = new RouteSelectionDebugInfo();
 
         if (message instanceof ReadRequest) {
           ReadRequest.Builder reqBuilder = ((ReadRequest) message).toBuilder();
           maybeTrackReadOnlyBegin(reqBuilder.getTransaction());
-          RoutingDecision routing = routeFromRequest(reqBuilder);
+          RoutingDecision routing = routeFromRequest(reqBuilder, debugInfo);
           finder = routing.finder;
           endpoint = routing.endpoint;
           message = (RequestT) reqBuilder.build();
         } else if (message instanceof ExecuteSqlRequest) {
           ExecuteSqlRequest.Builder reqBuilder = ((ExecuteSqlRequest) message).toBuilder();
           maybeTrackReadOnlyBegin(reqBuilder.getTransaction());
-          RoutingDecision routing = routeFromRequest(reqBuilder);
+          RoutingDecision routing = routeFromRequest(reqBuilder, debugInfo);
           finder = routing.finder;
           endpoint = routing.endpoint;
           message = (RequestT) reqBuilder.build();
@@ -530,11 +642,20 @@ final class KeyAwareChannel extends ManagedChannel {
           BeginTransactionRequest.Builder reqBuilder =
               ((BeginTransactionRequest) message).toBuilder();
           String databaseId = parentChannel.extractDatabaseIdFromSession(reqBuilder.getSession());
+          debugInfo.setDatabaseId(databaseId);
           if (databaseId != null) {
             finder = parentChannel.getOrCreateChannelFinder(databaseId);
           }
           if (finder != null && reqBuilder.hasMutationKey()) {
             endpoint = finder.findServer(reqBuilder, excludedEndpoints);
+            debugInfo.setRouteSource("begin_transaction_mutation_key");
+          } else if (!reqBuilder.hasMutationKey()) {
+            debugInfo.setDefaultReason(
+                "begin_transaction_without_mutation_key",
+                "begin transaction request has no mutation key");
+          } else {
+            debugInfo.setDefaultReason(
+                "session_database_id_missing", "could not extract database id from session");
           }
           if (reqBuilder.hasOptions() && reqBuilder.getOptions().hasReadOnly()) {
             isReadOnlyBegin = true;
@@ -546,6 +667,7 @@ final class KeyAwareChannel extends ManagedChannel {
         } else if (message instanceof CommitRequest) {
           CommitRequest request = (CommitRequest) message;
           String databaseId = parentChannel.extractDatabaseIdFromSession(request.getSession());
+          debugInfo.setDatabaseId(databaseId);
           if (databaseId != null) {
             finder = parentChannel.getOrCreateChannelFinder(databaseId);
           }
@@ -553,13 +675,21 @@ final class KeyAwareChannel extends ManagedChannel {
           if (finder != null && request.getMutationsCount() > 0) {
             reqBuilder = request.toBuilder();
             endpoint = finder.fillRoutingHint(reqBuilder, excludedEndpoints);
+            debugInfo.setRouteSource("commit_mutation_routing");
             request = reqBuilder.build();
+          } else if (request.getMutationsCount() == 0) {
+            debugInfo.setDefaultReason(
+                "commit_without_routable_mutation", "commit has no mutations to route on");
+          } else {
+            debugInfo.setDefaultReason(
+                "session_database_id_missing", "could not extract database id from session");
           }
           if (!request.getTransactionId().isEmpty()) {
             ChannelEndpoint affinityEndpoint =
                 parentChannel.affinityEndpoint(request.getTransactionId(), excludedEndpoints);
             if (affinityEndpoint != null) {
               endpoint = affinityEndpoint;
+              debugInfo.setRouteSource("transaction_affinity");
             }
             transactionIdToClear = request.getTransactionId();
           }
@@ -571,7 +701,17 @@ final class KeyAwareChannel extends ManagedChannel {
           if (!request.getTransactionId().isEmpty()) {
             endpoint =
                 parentChannel.affinityEndpoint(request.getTransactionId(), excludedEndpoints);
+            if (endpoint != null) {
+              debugInfo.setRouteSource("transaction_affinity");
+            } else {
+              debugInfo.setDefaultReason(
+                  "rollback_affinity_missing",
+                  "no healthy affinity endpoint for rollback transaction id");
+            }
             transactionIdToClear = request.getTransactionId();
+          } else {
+            debugInfo.setDefaultReason(
+                "rollback_transaction_id_missing", "rollback request has no transaction id");
           }
         } else {
           throw new IllegalStateException(
@@ -580,7 +720,12 @@ final class KeyAwareChannel extends ManagedChannel {
         }
 
         if (endpoint == null) {
+          if (debugInfo.getDefaultReasonCode() == null) {
+            debugInfo.setDefaultReason(
+                "no_bypass_route_selected", "routing produced no bypass endpoint");
+          }
           endpoint = parentChannel.endpointCache.defaultChannel();
+          debugInfo.setRouteSource("default_endpoint");
         }
         if (endpoint == null) {
           throw new IllegalStateException("No default endpoint available for key-aware call");
@@ -595,7 +740,15 @@ final class KeyAwareChannel extends ManagedChannel {
             methodDescriptor,
             endpoint.getAddress(),
             parentChannel.defaultEndpointAddress.equals(endpoint.getAddress()),
-            finder != null);
+            finder != null,
+            debugInfo);
+        parentChannel.routeDecisionSummaryLogger.recordAttempt(
+            parentChannel.defaultEndpointAddress.equals(endpoint.getAddress()),
+            hadResourceExhaustedExcludedEndpoints(),
+            parentChannel.defaultEndpointAddress.equals(endpoint.getAddress())
+                ? null
+                : endpoint.getAddress(),
+            debugInfo);
         delegate = endpoint.getChannel().newCall(methodDescriptor, callOptions);
         if (pendingMessageCompression != null) {
           delegate.setMessageCompression(pendingMessageCompression);
@@ -738,13 +891,25 @@ final class KeyAwareChannel extends ManagedChannel {
 
     private Predicate<String> excludedEndpoints() {
       if (excludedEndpoints == null) {
-        excludedEndpoints = parentChannel.consumeExcludedEndpointsForCurrentCall(logicalRequestKey);
+        excludedEndpointAddresses =
+            parentChannel.consumeExcludedEndpointsForCurrentCall(logicalRequestKey);
+        excludedEndpoints =
+            excludedEndpointAddresses.isEmpty()
+                ? address -> false
+                : excludedEndpointAddresses::contains;
       }
       return excludedEndpoints;
     }
 
-    private RoutingDecision routeFromRequest(ReadRequest.Builder reqBuilder) {
+    private boolean hadResourceExhaustedExcludedEndpoints() {
+      excludedEndpoints();
+      return excludedEndpointAddresses != null && !excludedEndpointAddresses.isEmpty();
+    }
+
+    private RoutingDecision routeFromRequest(
+        ReadRequest.Builder reqBuilder, RouteSelectionDebugInfo debugInfo) {
       String databaseId = parentChannel.extractDatabaseIdFromSession(reqBuilder.getSession());
+      debugInfo.setDatabaseId(databaseId);
       ByteString transactionId = transactionIdFromSelector(reqBuilder.getTransaction());
       // Skip affinity for read-only transactions so each read routes independently.
       boolean isReadOnly = parentChannel.isReadOnlyTransaction(transactionId);
@@ -752,22 +917,34 @@ final class KeyAwareChannel extends ManagedChannel {
       ChannelEndpoint endpoint =
           isReadOnly ? null : parentChannel.affinityEndpoint(transactionId, excludedEndpoints);
       ChannelFinder finder = null;
+      if (endpoint != null) {
+        debugInfo.setRouteSource("transaction_affinity");
+      }
       if (databaseId != null) {
         finder = parentChannel.getOrCreateChannelFinder(databaseId);
       }
       if (databaseId != null && endpoint == null) {
         Boolean preferLeaderOverride = parentChannel.readOnlyPreferLeader(transactionId);
-        ChannelEndpoint routed =
+        ChannelFinder.RouteResult routed =
             preferLeaderOverride != null
-                ? finder.findServer(reqBuilder, preferLeaderOverride, excludedEndpoints)
-                : finder.findServer(reqBuilder, excludedEndpoints);
-        endpoint = routed;
+                ? finder.findServerWithDebug(
+                    reqBuilder, preferLeaderOverride, excludedEndpoints, debugInfo)
+                : finder.findServerWithDebug(reqBuilder, excludedEndpoints, debugInfo);
+        endpoint = routed.endpoint;
+        if (endpoint != null) {
+          debugInfo.setRouteSource("key_based_routing");
+        }
+      } else if (databaseId == null && endpoint == null) {
+        debugInfo.setDefaultReason(
+            "session_database_id_missing", "could not extract database id from session");
       }
       return new RoutingDecision(finder, endpoint);
     }
 
-    private RoutingDecision routeFromRequest(ExecuteSqlRequest.Builder reqBuilder) {
+    private RoutingDecision routeFromRequest(
+        ExecuteSqlRequest.Builder reqBuilder, RouteSelectionDebugInfo debugInfo) {
       String databaseId = parentChannel.extractDatabaseIdFromSession(reqBuilder.getSession());
+      debugInfo.setDatabaseId(databaseId);
       ByteString transactionId = transactionIdFromSelector(reqBuilder.getTransaction());
       // Skip affinity for read-only transactions so each query routes independently.
       boolean isReadOnly = parentChannel.isReadOnlyTransaction(transactionId);
@@ -775,16 +952,26 @@ final class KeyAwareChannel extends ManagedChannel {
       ChannelEndpoint endpoint =
           isReadOnly ? null : parentChannel.affinityEndpoint(transactionId, excludedEndpoints);
       ChannelFinder finder = null;
+      if (endpoint != null) {
+        debugInfo.setRouteSource("transaction_affinity");
+      }
       if (databaseId != null) {
         finder = parentChannel.getOrCreateChannelFinder(databaseId);
       }
       if (databaseId != null && endpoint == null) {
         Boolean preferLeaderOverride = parentChannel.readOnlyPreferLeader(transactionId);
-        ChannelEndpoint routed =
+        ChannelFinder.RouteResult routed =
             preferLeaderOverride != null
-                ? finder.findServer(reqBuilder, preferLeaderOverride, excludedEndpoints)
-                : finder.findServer(reqBuilder, excludedEndpoints);
-        endpoint = routed;
+                ? finder.findServerWithDebug(
+                    reqBuilder, preferLeaderOverride, excludedEndpoints, debugInfo)
+                : finder.findServerWithDebug(reqBuilder, excludedEndpoints, debugInfo);
+        endpoint = routed.endpoint;
+        if (endpoint != null) {
+          debugInfo.setRouteSource("key_based_routing");
+        }
+      } else if (databaseId == null && endpoint == null) {
+        debugInfo.setDefaultReason(
+            "session_database_id_missing", "could not extract database id from session");
       }
       return new RoutingDecision(finder, endpoint);
     }

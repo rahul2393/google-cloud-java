@@ -66,6 +66,7 @@ public final class KeyRangeCache {
 
   private final ChannelEndpointCache endpointCache;
   @javax.annotation.Nullable private final EndpointLifecycleManager lifecycleManager;
+  @javax.annotation.Nullable private final RouteDecisionSummaryLogger routeDecisionSummaryLogger;
   private final NavigableMap<ByteString, CachedRange> ranges =
       new TreeMap<>(ByteString.unsignedLexicographicalComparator());
   private final Map<Long, CachedGroup> groups = new HashMap<>();
@@ -78,14 +79,22 @@ public final class KeyRangeCache {
   private volatile int minCacheEntriesForRandomPick = DEFAULT_MIN_ENTRIES_FOR_RANDOM_PICK;
 
   public KeyRangeCache(ChannelEndpointCache endpointCache) {
-    this(endpointCache, null);
+    this(endpointCache, null, null);
   }
 
   public KeyRangeCache(
       ChannelEndpointCache endpointCache,
       @javax.annotation.Nullable EndpointLifecycleManager lifecycleManager) {
+    this(endpointCache, lifecycleManager, null);
+  }
+
+  public KeyRangeCache(
+      ChannelEndpointCache endpointCache,
+      @javax.annotation.Nullable EndpointLifecycleManager lifecycleManager,
+      @javax.annotation.Nullable RouteDecisionSummaryLogger routeDecisionSummaryLogger) {
     this.endpointCache = Objects.requireNonNull(endpointCache);
     this.lifecycleManager = lifecycleManager;
+    this.routeDecisionSummaryLogger = routeDecisionSummaryLogger;
   }
 
   @VisibleForTesting
@@ -153,21 +162,51 @@ public final class KeyRangeCache {
       DirectedReadOptions directedReadOptions,
       RoutingHint.Builder hintBuilder,
       Predicate<String> excludedEndpoints) {
+    return fillRoutingHintWithDebug(
+            preferLeader,
+            rangeMode,
+            directedReadOptions,
+            hintBuilder,
+            excludedEndpoints,
+            null)
+        .endpoint;
+  }
+
+  RouteLookupResult fillRoutingHintWithDebug(
+      boolean preferLeader,
+      RangeMode rangeMode,
+      DirectedReadOptions directedReadOptions,
+      RoutingHint.Builder hintBuilder,
+      Predicate<String> excludedEndpoints,
+      @javax.annotation.Nullable RouteSelectionDebugInfo debugInfo) {
     ByteString key = hintBuilder.getKey();
     if (key.isEmpty()) {
-      return null;
+      if (debugInfo != null) {
+        debugInfo.setDefaultReason(
+            "routing_hint_key_missing", "routing hint key is empty before range lookup");
+      }
+      return RouteLookupResult.noEndpoint();
     }
 
     CachedRange targetRange;
+    long rangeLookupStartNanos = debugInfo != null ? System.nanoTime() : 0L;
     readLock.lock();
     try {
-      targetRange = findRangeLocked(key, hintBuilder.getLimitKey(), rangeMode);
+      targetRange = findRangeLocked(key, hintBuilder.getLimitKey(), rangeMode, debugInfo);
     } finally {
       readLock.unlock();
     }
+    if (debugInfo != null) {
+      debugInfo.setRangeLookupDurationMs(
+          java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(
+              System.nanoTime() - rangeLookupStartNanos));
+    }
 
     if (targetRange == null || targetRange.group == null) {
-      return null;
+      if (targetRange != null && targetRange.group == null && debugInfo != null) {
+        debugInfo.setDefaultReason("range_group_missing", "cached range has no group");
+      }
+      return RouteLookupResult.noEndpoint();
     }
 
     hintBuilder.setGroupUid(targetRange.group.groupUid);
@@ -175,8 +214,10 @@ public final class KeyRangeCache {
     hintBuilder.setKey(targetRange.startKey);
     hintBuilder.setLimitKey(targetRange.limitKey);
 
-    return targetRange.group.fillRoutingHint(
-        preferLeader, directedReadOptions, hintBuilder, excludedEndpoints);
+    ChannelEndpoint endpoint =
+        targetRange.group.fillRoutingHint(
+            preferLeader, directedReadOptions, hintBuilder, excludedEndpoints, debugInfo);
+    return endpoint == null ? RouteLookupResult.noEndpoint() : RouteLookupResult.of(endpoint);
   }
 
   /** Returns all server addresses currently referenced by cached tablets. */
@@ -281,9 +322,16 @@ public final class KeyRangeCache {
     return accessCounter.incrementAndGet();
   }
 
-  private CachedRange findRangeLocked(ByteString key, ByteString limit, RangeMode mode) {
+  private CachedRange findRangeLocked(
+      ByteString key,
+      ByteString limit,
+      RangeMode mode,
+      @javax.annotation.Nullable RouteSelectionDebugInfo debugInfo) {
     Map.Entry<ByteString, CachedRange> entry = ranges.higherEntry(key);
     if (entry == null) {
+      if (debugInfo != null) {
+        debugInfo.setDefaultReason("range_cache_miss", "no cached split covers request key");
+      }
       return null;
     }
 
@@ -294,6 +342,9 @@ public final class KeyRangeCache {
         firstRange.lastAccess = accessTimeNow();
         return firstRange;
       }
+      if (debugInfo != null) {
+        debugInfo.setDefaultReason("range_cache_miss", "request key falls before cached split");
+      }
       return null;
     }
 
@@ -303,6 +354,10 @@ public final class KeyRangeCache {
       return firstRange;
     }
     if (mode == RangeMode.COVERING_SPLIT) {
+      if (debugInfo != null) {
+        debugInfo.setDefaultReason(
+            "range_cache_miss", "request limit key spans multiple splits for covering-split mode");
+      }
       return null;
     }
 
@@ -345,6 +400,11 @@ public final class KeyRangeCache {
       CachedRange selected = sampled.getValue();
       selected.lastAccess = accessTimeNow();
       return selected;
+    }
+    if (debugInfo != null) {
+      debugInfo.setDefaultReason(
+          "range_cache_gap",
+          "range lookup saw a split gap before random split selection could complete");
     }
     return null;
   }
@@ -570,14 +630,23 @@ public final class KeyRangeCache {
      *       address for repeated TRANSIENT_FAILURE, in which case report it in skipped_tablets.
      * </ul>
      */
-    boolean shouldSkip(
+    @javax.annotation.Nullable
+    SkipReason shouldSkip(
         RoutingHint.Builder hintBuilder,
         Predicate<String> excludedEndpoints,
         Set<Long> skippedTabletUids) {
       // Server-marked skip, no address, or excluded endpoint: always report.
-      if (skip || serverAddress.isEmpty() || excludedEndpoints.test(serverAddress)) {
+      if (skip) {
         addSkippedTablet(hintBuilder, skippedTabletUids);
-        return true;
+        return SkipReason.SERVER_MARKED_SKIP;
+      }
+      if (serverAddress.isEmpty()) {
+        addSkippedTablet(hintBuilder, skippedTabletUids);
+        return SkipReason.EMPTY_ADDRESS;
+      }
+      if (excludedEndpoints.test(serverAddress)) {
+        addSkippedTablet(hintBuilder, skippedTabletUids);
+        return SkipReason.EXCLUDED_ENDPOINT;
       }
 
       // If the cached endpoint's channel has been shut down (e.g. after idle eviction),
@@ -595,7 +664,7 @@ public final class KeyRangeCache {
       }
 
       if (endpoint.isHealthy()) {
-        return false;
+        return null;
       }
 
       if (lifecycleManager != null) {
@@ -603,20 +672,26 @@ public final class KeyRangeCache {
       }
 
       if (endpoint.isTransientFailure()) {
+        if (routeDecisionSummaryLogger != null) {
+          routeDecisionSummaryLogger.recordTransientFailureSkip(serverAddress);
+        }
         logger.log(
             Level.FINE,
-            "Tablet {0} at {1}: endpoint in TRANSIENT_FAILURE, adding to skipped_tablets",
+            "Tablet {0} at {1}: endpoint in TRANSIENT_FAILURE, adding to skipped_tablet_uid",
             new Object[] {tabletUid, serverAddress});
         addSkippedTablet(hintBuilder, skippedTabletUids);
-        return true;
+        return SkipReason.TRANSIENT_FAILURE;
       }
 
+      if (routeDecisionSummaryLogger != null) {
+        routeDecisionSummaryLogger.recordEndpointNotReadySkip(serverAddress);
+      }
       logger.log(
           Level.FINE,
           "Tablet {0} at {1}: endpoint not ready, skipping silently",
           new Object[] {tabletUid, serverAddress});
       maybeAddRecentTransientFailureSkip(hintBuilder, skippedTabletUids);
-      return true;
+      return SkipReason.ENDPOINT_NOT_READY;
     }
 
     private void addSkippedTablet(RoutingHint.Builder hintBuilder, Set<Long> skippedTabletUids) {
@@ -645,6 +720,10 @@ public final class KeyRangeCache {
       }
 
       if (endpoint != null && endpoint.isTransientFailure()) {
+        logger.log(
+            Level.FINE,
+            "Tablet {0} at {1}: known TRANSIENT_FAILURE replica recorded in skipped_tablet_uid",
+            new Object[] {tabletUid, serverAddress});
         addSkippedTablet(hintBuilder, skippedTabletUids);
         return;
       }
@@ -656,6 +735,10 @@ public final class KeyRangeCache {
         RoutingHint.Builder hintBuilder, Set<Long> skippedTabletUids) {
       if (lifecycleManager != null
           && lifecycleManager.wasRecentlyEvictedTransientFailure(serverAddress)) {
+        logger.log(
+            Level.FINE,
+            "Tablet {0} at {1}: recently evicted TRANSIENT_FAILURE replica recorded in skipped_tablet_uid",
+            new Object[] {tabletUid, serverAddress});
         addSkippedTablet(hintBuilder, skippedTabletUids);
       }
     }
@@ -742,15 +825,18 @@ public final class KeyRangeCache {
         boolean preferLeader,
         DirectedReadOptions directedReadOptions,
         RoutingHint.Builder hintBuilder,
-        Predicate<String> excludedEndpoints) {
+        Predicate<String> excludedEndpoints,
+        @javax.annotation.Nullable RouteSelectionDebugInfo debugInfo) {
       Set<Long> skippedTabletUids = skippedTabletUids(hintBuilder);
       boolean hasDirectedReadOptions =
           directedReadOptions.getReplicasCase()
               != DirectedReadOptions.ReplicasCase.REPLICAS_NOT_SET;
+      TabletSelectionStats stats = new TabletSelectionStats();
 
       // Select a tablet while holding the lock. shouldSkip() creates missing endpoints on
       // demand, registers them for background warmup if needed, and only accepts READY tablets
       // for the foreground RPC.
+      long tabletSelectionStartNanos = debugInfo != null ? System.nanoTime() : 0L;
       synchronized (this) {
         CachedTablet selected =
             selectTabletLocked(
@@ -759,8 +845,30 @@ public final class KeyRangeCache {
                 hintBuilder,
                 directedReadOptions,
                 excludedEndpoints,
-                skippedTabletUids);
+                skippedTabletUids,
+                stats);
+        if (debugInfo != null) {
+          debugInfo.setTabletSelectionDurationMs(
+              java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(
+                  System.nanoTime() - tabletSelectionStartNanos));
+          debugInfo.recordTabletSelectionStats(
+              stats.matchedTabletCount,
+              stats.replicaFilteredCount,
+              stats.serverSkipCount,
+              stats.emptyAddressCount,
+              stats.excludedEndpointCount,
+              stats.transientFailureCount,
+              stats.endpointNotReadyCount,
+              selected != null,
+              stats.selectedFirstReplica,
+              stats.selectedLeader,
+              stats.leaderSkippedTransientFailure,
+              stats.leaderSkippedEndpointNotReady);
+        }
         if (selected == null) {
+          if (debugInfo != null) {
+            debugInfo.setDefaultReason(stats.reasonCode(), stats.detail());
+          }
           return null;
         }
         recordKnownTransientFailuresLocked(
@@ -775,16 +883,22 @@ public final class KeyRangeCache {
         RoutingHint.Builder hintBuilder,
         DirectedReadOptions directedReadOptions,
         Predicate<String> excludedEndpoints,
-        Set<Long> skippedTabletUids) {
+        Set<Long> skippedTabletUids,
+        TabletSelectionStats stats) {
       boolean checkedLeader = false;
       if (preferLeader
           && !hasDirectedReadOptions
           && hasLeader()
           && leader().distance <= MAX_LOCAL_REPLICA_DISTANCE) {
         checkedLeader = true;
-        if (!leader().shouldSkip(hintBuilder, excludedEndpoints, skippedTabletUids)) {
+        stats.recordMatchedTablet();
+        SkipReason leaderSkip =
+            leader().shouldSkip(hintBuilder, excludedEndpoints, skippedTabletUids);
+        if (leaderSkip == null) {
+          stats.recordSelection(leaderIndex, true);
           return leader();
         }
+        stats.recordLeaderSkip(leaderSkip);
       }
       for (int index = 0; index < tablets.size(); index++) {
         if (checkedLeader && index == leaderIndex) {
@@ -792,11 +906,16 @@ public final class KeyRangeCache {
         }
         CachedTablet tablet = tablets.get(index);
         if (!tablet.matches(directedReadOptions)) {
+          stats.replicaFilteredCount++;
           continue;
         }
-        if (tablet.shouldSkip(hintBuilder, excludedEndpoints, skippedTabletUids)) {
+        stats.recordMatchedTablet();
+        SkipReason skipReason = tablet.shouldSkip(hintBuilder, excludedEndpoints, skippedTabletUids);
+        if (skipReason != null) {
+          stats.recordSkip(skipReason);
           continue;
         }
+        stats.recordSelection(index, hasLeader() && index == leaderIndex);
         return tablet;
       }
       return null;
@@ -847,6 +966,113 @@ public final class KeyRangeCache {
       sb.append("]@").append(generation.toStringUtf8());
       sb.append("#").append(refs);
       return sb.toString();
+    }
+  }
+
+  static final class RouteLookupResult {
+    @javax.annotation.Nullable final ChannelEndpoint endpoint;
+
+    private RouteLookupResult(@javax.annotation.Nullable ChannelEndpoint endpoint) {
+      this.endpoint = endpoint;
+    }
+
+    private static RouteLookupResult of(ChannelEndpoint endpoint) {
+      return new RouteLookupResult(endpoint);
+    }
+
+    private static RouteLookupResult noEndpoint() {
+      return new RouteLookupResult(null);
+    }
+  }
+
+  private enum SkipReason {
+    SERVER_MARKED_SKIP,
+    EMPTY_ADDRESS,
+    EXCLUDED_ENDPOINT,
+    TRANSIENT_FAILURE,
+    ENDPOINT_NOT_READY
+  }
+
+  private static final class TabletSelectionStats {
+    private int matchedTabletCount;
+    private int replicaFilteredCount;
+    private int serverSkipCount;
+    private int emptyAddressCount;
+    private int excludedEndpointCount;
+    private int transientFailureCount;
+    private int endpointNotReadyCount;
+    private boolean selectedFirstReplica;
+    private boolean selectedLeader;
+    private boolean leaderSkippedTransientFailure;
+    private boolean leaderSkippedEndpointNotReady;
+
+    private void recordMatchedTablet() {
+      matchedTabletCount++;
+    }
+
+    private void recordSkip(SkipReason skipReason) {
+      switch (skipReason) {
+        case SERVER_MARKED_SKIP:
+          serverSkipCount++;
+          break;
+        case EMPTY_ADDRESS:
+          emptyAddressCount++;
+          break;
+        case EXCLUDED_ENDPOINT:
+          excludedEndpointCount++;
+          break;
+        case TRANSIENT_FAILURE:
+          transientFailureCount++;
+          break;
+        case ENDPOINT_NOT_READY:
+          endpointNotReadyCount++;
+          break;
+        default:
+          break;
+      }
+    }
+
+    private void recordLeaderSkip(SkipReason skipReason) {
+      recordSkip(skipReason);
+      switch (skipReason) {
+        case TRANSIENT_FAILURE:
+          leaderSkippedTransientFailure = true;
+          break;
+        case ENDPOINT_NOT_READY:
+          leaderSkippedEndpointNotReady = true;
+          break;
+        default:
+          break;
+      }
+    }
+
+    private void recordSelection(int selectedIndex, boolean selectedLeader) {
+      this.selectedFirstReplica = selectedIndex == 0;
+      this.selectedLeader = selectedLeader;
+    }
+
+    private String reasonCode() {
+      if (matchedTabletCount == 0) {
+        return "no_tablet_matches_replica_policy";
+      }
+      return "no_healthy_tablet_for_group";
+    }
+
+    private String detail() {
+      return "matched="
+          + matchedTabletCount
+          + ",replica_filtered="
+          + replicaFilteredCount
+          + ",server_skip="
+          + serverSkipCount
+          + ",empty_address="
+          + emptyAddressCount
+          + ",excluded_endpoint="
+          + excludedEndpointCount
+          + ",transient_failure="
+          + transientFailureCount
+          + ",endpoint_not_ready="
+          + endpointNotReadyCount;
     }
   }
 

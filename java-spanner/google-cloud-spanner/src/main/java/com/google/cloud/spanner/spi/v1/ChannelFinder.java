@@ -51,12 +51,21 @@ public final class ChannelFinder {
   private final KeyRangeCache rangeCache;
 
   public ChannelFinder(ChannelEndpointCache endpointCache) {
-    this(endpointCache, null);
+    this(endpointCache, null, null);
   }
 
   public ChannelFinder(
       ChannelEndpointCache endpointCache, @Nullable EndpointLifecycleManager lifecycleManager) {
-    this.rangeCache = new KeyRangeCache(Objects.requireNonNull(endpointCache), lifecycleManager);
+    this(endpointCache, lifecycleManager, null);
+  }
+
+  public ChannelFinder(
+      ChannelEndpointCache endpointCache,
+      @Nullable EndpointLifecycleManager lifecycleManager,
+      @Nullable RouteDecisionSummaryLogger routeDecisionSummaryLogger) {
+    this.rangeCache =
+        new KeyRangeCache(
+            Objects.requireNonNull(endpointCache), lifecycleManager, routeDecisionSummaryLogger);
   }
 
   void useDeterministicRandom() {
@@ -121,19 +130,43 @@ public final class ChannelFinder {
     return findServer(reqBuilder, preferLeader(reqBuilder.getTransaction()), excludedEndpoints);
   }
 
+  RouteResult findServerWithDebug(
+      ReadRequest.Builder reqBuilder,
+      Predicate<String> excludedEndpoints,
+      @Nullable RouteSelectionDebugInfo debugInfo) {
+    return findServerWithDebug(
+        reqBuilder, preferLeader(reqBuilder.getTransaction()), excludedEndpoints, debugInfo);
+  }
+
   public ChannelEndpoint findServer(ReadRequest.Builder reqBuilder, boolean preferLeader) {
     return findServer(reqBuilder, preferLeader, NO_EXCLUDED_ENDPOINTS);
   }
 
   public ChannelEndpoint findServer(
       ReadRequest.Builder reqBuilder, boolean preferLeader, Predicate<String> excludedEndpoints) {
-    recipeCache.computeKeys(reqBuilder);
+    return findServerWithDebug(reqBuilder, preferLeader, excludedEndpoints, null).endpoint;
+  }
+
+  RouteResult findServerWithDebug(
+      ReadRequest.Builder reqBuilder,
+      boolean preferLeader,
+      Predicate<String> excludedEndpoints,
+      @Nullable RouteSelectionDebugInfo debugInfo) {
+    KeyRecipeCache.RoutingPreparationStatus status = recipeCache.computeKeys(reqBuilder, debugInfo);
+    if (status != KeyRecipeCache.RoutingPreparationStatus.OK) {
+      if (status == KeyRecipeCache.RoutingPreparationStatus.EMPTY_ROUTING_KEY && debugInfo != null) {
+        debugInfo.setDefaultReason(
+            "read_routing_key_missing", "routing hint key empty after read key computation");
+      }
+      return RouteResult.noEndpoint();
+    }
     return fillRoutingHint(
         preferLeader,
         KeyRangeCache.RangeMode.COVERING_SPLIT,
         reqBuilder.getDirectedReadOptions(),
         reqBuilder.getRoutingHintBuilder(),
-        excludedEndpoints);
+        excludedEndpoints,
+        debugInfo);
   }
 
   public ChannelEndpoint findServer(ExecuteSqlRequest.Builder reqBuilder) {
@@ -145,6 +178,14 @@ public final class ChannelFinder {
     return findServer(reqBuilder, preferLeader(reqBuilder.getTransaction()), excludedEndpoints);
   }
 
+  RouteResult findServerWithDebug(
+      ExecuteSqlRequest.Builder reqBuilder,
+      Predicate<String> excludedEndpoints,
+      @Nullable RouteSelectionDebugInfo debugInfo) {
+    return findServerWithDebug(
+        reqBuilder, preferLeader(reqBuilder.getTransaction()), excludedEndpoints, debugInfo);
+  }
+
   public ChannelEndpoint findServer(ExecuteSqlRequest.Builder reqBuilder, boolean preferLeader) {
     return findServer(reqBuilder, preferLeader, NO_EXCLUDED_ENDPOINTS);
   }
@@ -153,13 +194,30 @@ public final class ChannelFinder {
       ExecuteSqlRequest.Builder reqBuilder,
       boolean preferLeader,
       Predicate<String> excludedEndpoints) {
-    recipeCache.computeKeys(reqBuilder);
+    return findServerWithDebug(reqBuilder, preferLeader, excludedEndpoints, null).endpoint;
+  }
+
+  RouteResult findServerWithDebug(
+      ExecuteSqlRequest.Builder reqBuilder,
+      boolean preferLeader,
+      Predicate<String> excludedEndpoints,
+      @Nullable RouteSelectionDebugInfo debugInfo) {
+    KeyRecipeCache.RoutingPreparationStatus status = recipeCache.computeKeys(reqBuilder, debugInfo);
+    if (status != KeyRecipeCache.RoutingPreparationStatus.OK) {
+      if (status == KeyRecipeCache.RoutingPreparationStatus.EMPTY_ROUTING_KEY
+          && debugInfo != null) {
+        debugInfo.setDefaultReason(
+            "query_routing_key_missing", "routing hint key empty after query key computation");
+      }
+      return RouteResult.noEndpoint();
+    }
     return fillRoutingHint(
         preferLeader,
         KeyRangeCache.RangeMode.PICK_RANDOM,
         reqBuilder.getDirectedReadOptions(),
         reqBuilder.getRoutingHintBuilder(),
-        excludedEndpoints);
+        excludedEndpoints,
+        debugInfo);
   }
 
   public ChannelEndpoint findServer(BeginTransactionRequest.Builder reqBuilder) {
@@ -241,13 +299,41 @@ public final class ChannelFinder {
       DirectedReadOptions directedReadOptions,
       RoutingHint.Builder hintBuilder,
       Predicate<String> excludedEndpoints) {
+    return fillRoutingHint(
+            preferLeader, rangeMode, directedReadOptions, hintBuilder, excludedEndpoints, null)
+        .endpoint;
+  }
+
+  private RouteResult fillRoutingHint(
+      boolean preferLeader,
+      KeyRangeCache.RangeMode rangeMode,
+      DirectedReadOptions directedReadOptions,
+      RoutingHint.Builder hintBuilder,
+      Predicate<String> excludedEndpoints,
+      @Nullable RouteSelectionDebugInfo debugInfo) {
     long id = databaseId.get();
     if (id == 0) {
-      return null;
+      if (debugInfo != null) {
+        debugInfo.setDefaultReason(
+            "location_cache_uninitialized", "database id not initialized from cache update");
+      }
+      return RouteResult.noEndpoint();
     }
     hintBuilder.setDatabaseId(id);
-    return rangeCache.fillRoutingHint(
-        preferLeader, rangeMode, directedReadOptions, hintBuilder, excludedEndpoints);
+    if (debugInfo != null) {
+      debugInfo.captureRoutingHint(hintBuilder);
+    }
+    KeyRangeCache.RouteLookupResult routeLookupResult =
+        rangeCache.fillRoutingHintWithDebug(
+            preferLeader,
+            rangeMode,
+            directedReadOptions,
+            hintBuilder,
+            excludedEndpoints,
+            debugInfo);
+    return routeLookupResult.endpoint == null
+        ? RouteResult.noEndpoint()
+        : RouteResult.of(routeLookupResult.endpoint);
   }
 
   private static boolean preferLeader(TransactionSelector selector) {
@@ -271,5 +357,21 @@ public final class ChannelFinder {
       return true;
     }
     return options.getReadOnly().getStrong();
+  }
+
+  static final class RouteResult {
+    @Nullable final ChannelEndpoint endpoint;
+
+    private RouteResult(@Nullable ChannelEndpoint endpoint) {
+      this.endpoint = endpoint;
+    }
+
+    private static RouteResult noEndpoint() {
+      return new RouteResult(null);
+    }
+
+    private static RouteResult of(ChannelEndpoint endpoint) {
+      return new RouteResult(endpoint);
+    }
   }
 }

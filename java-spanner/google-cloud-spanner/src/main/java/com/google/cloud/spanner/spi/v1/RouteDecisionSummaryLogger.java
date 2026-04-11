@@ -35,7 +35,7 @@ import javax.annotation.Nullable;
 @InternalApi
 final class RouteDecisionSummaryLogger {
   private static final Logger logger = Logger.getLogger(KeyAwareChannel.class.getName());
-  private static final long DEFAULT_LOG_INTERVAL_NANOS = TimeUnit.MINUTES.toNanos(5);
+  private static final long DEFAULT_LOG_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10);
   private static final int ADDRESS_SUMMARY_LIMIT = 5;
 
   private final long logIntervalNanos;

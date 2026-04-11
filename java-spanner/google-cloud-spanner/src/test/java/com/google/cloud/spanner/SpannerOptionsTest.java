@@ -205,6 +205,44 @@ public class SpannerOptionsTest {
     assertFalse(operationCountMetric.getLongSumData().getPoints().isEmpty());
   }
 
+  @Test
+  public void builtInMetricsCanBeExportedToInjectedOpenTelemetryWithNoCredentials() {
+    InMemoryMetricReader inMemoryMetricReader = InMemoryMetricReader.create();
+    SdkMeterProviderBuilder meterProviderBuilder =
+        SdkMeterProvider.builder().registerMetricReader(inMemoryMetricReader);
+    SpannerOptions.registerBuiltInMetricViews(meterProviderBuilder);
+    OpenTelemetry openTelemetry =
+        OpenTelemetrySdk.builder().setMeterProvider(meterProviderBuilder.build()).build();
+
+    SpannerOptions options =
+        SpannerOptions.newBuilder()
+            .setProjectId("test-project")
+            .setBuiltInMetricsEnabled(false)
+            .setCredentials(NoCredentials.getInstance())
+            .setOpenTelemetry(openTelemetry)
+            .setExportBuiltInMetricsToOpenTelemetry(true)
+            .build();
+
+    ApiTracer tracer =
+        options
+            .getApiTracerFactory()
+            .newTracer(
+                null, SpanName.of("Spanner", "ExecuteSql"), ApiTracerFactory.OperationType.Unary);
+
+    tracer.attemptStarted(null, 0);
+    tracer.requestSent();
+    tracer.responseReceived();
+    tracer.attemptSucceeded();
+    tracer.operationSucceeded();
+
+    MetricData operationCountMetric =
+        getMetricData(
+            inMemoryMetricReader,
+            BuiltInMetricsConstant.METER_NAME + "/" + BuiltInMetricsConstant.OPERATION_COUNT_NAME);
+    assertNotNull(operationCountMetric);
+    assertFalse(operationCountMetric.getLongSumData().getPoints().isEmpty());
+  }
+
   private MetricData getMetricData(InMemoryMetricReader reader, String metricName) {
     Collection<MetricData> metrics = reader.collectAllMetrics();
     return metrics.stream().filter(metric -> metric.getName().equals(metricName)).findFirst().orElse(null);

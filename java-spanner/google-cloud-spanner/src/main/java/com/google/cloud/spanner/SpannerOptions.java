@@ -2525,13 +2525,14 @@ public class SpannerOptions extends ServiceOptions<Spanner, SpannerOptions> {
     apiTracerFactories.add(
         MoreObjects.firstNonNull(super.getApiTracerFactory(), getDefaultApiTracerFactory()));
 
-    // Add Metrics Tracer factory if built-in metrics are enabled for the internal exporter or if
-    // they should be exported to caller-provided OpenTelemetry. Skip for admin, emulator, or
-    // credential-less clients.
-    if ((isEnableBuiltInMetrics() || exportBuiltInMetricsToOpenTelemetry)
+    // Internal built-in metrics still require real credentials, but caller-provided OpenTelemetry
+    // export should not depend on the credentials that the Spanner client itself uses.
+    boolean shouldCreateInternalBuiltInMetricsTracer =
+        isEnableBuiltInMetrics() && !usesNoCredentials();
+    boolean shouldCreateCustomOpenTelemetryMetricsTracer = exportBuiltInMetricsToOpenTelemetry;
+    if ((shouldCreateInternalBuiltInMetricsTracer || shouldCreateCustomOpenTelemetryMetricsTracer)
         && !isAdminClient
-        && !isEmulatorEnabled
-        && !usesNoCredentials()) {
+        && !isEmulatorEnabled) {
       ApiTracerFactory metricsTracerFactory = createMetricsApiTracerFactory();
       if (metricsTracerFactory != null) {
         apiTracerFactories.add(metricsTracerFactory);

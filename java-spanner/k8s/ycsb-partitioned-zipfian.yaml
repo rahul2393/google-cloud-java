@@ -1,0 +1,72 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  namespace: spanner-ns
+  name: ycsb-java-zipfian
+spec:
+  completions: 80
+  parallelism: 80
+  completionMode: Indexed
+  backoffLimit: 0
+  activeDeadlineSeconds: 18000
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: ycsb-java-zipfian
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        iam.gke.io/gke-metadata-server-enabled: "true"
+      containers:
+        - name: ycsb-java-client
+          image: us-west1-docker.pkg.dev/outbound-flight/spanner-box/ycsb-client:latest
+          imagePullPolicy: Always
+          args:
+            - run
+            - cloudspanner
+            - -P
+            - workloads/workloadb
+            - -P
+            - cloudspanner/conf/cloudspanner.properties
+            - -p
+            - recordcount=1000000000000
+            - -p
+            - zeropadding=20
+            - -p
+            - insertorder=ordered
+            - -p
+            - operationcount=1000000000000
+            - -p
+            - maxexecutiontime=18000
+            - -p
+            - requestdistribution=zipfian
+            - -p
+            - requestpartition.count=80
+            - -p
+            - requestpartition.index=$(JOB_COMPLETION_INDEX)
+            - -p
+            - requestpartition.size=100000000
+            - -threads
+            - "100"
+            - -s
+          resources:
+            requests:
+              cpu: "7"
+              memory: "25Gi"
+            limits:
+              cpu: "7"
+              memory: "25Gi"
+          env:
+            - name: JOB_COMPLETION_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+            - name: GOOGLE_SPANNER_EXPERIMENTAL_LOCATION_API
+              value: "true"
+            - name: SPANNER_DISABLE_BUILTIN_METRICS
+              value: "true"
+            - name: SPANNER_DISABLE_DIRECT_ACCESS_GRPC_BUILTIN_METRICS
+              value: "true"
+            - name: JAVA_TOOL_OPTIONS
+              value: "-Xms16g -Xmx16g -XX:+AlwaysPreTouch -XX:+UseG1GC -Droot.level=ERROR -Djava.util.logging.config.file=/ycsb/cloudspanner/conf/logging-debug.properties"

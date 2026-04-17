@@ -646,7 +646,7 @@ public class CoreWorkload extends Workload {
       }
       long opcount = Long.parseLong(p.getProperty(Client.OPERATION_COUNT_PROPERTY, "0"));
       long expectednewkeys = (long) (opcount * insertproportion * 2.0);
-      keyrangeUpperBound = insertstart + insertcount + expectednewkeys;
+      keyrangeUpperBound += expectednewkeys;
       RequestPartitionRange partitionRange =
           requestPartitionRange(
               keyrangeLowerBound, keyrangeUpperBound, partitionCount, partitionIndex, partitionSize);

@@ -102,4 +102,26 @@ public class TestCoreWorkload {
     CoreWorkload.createRequestDistributionState(
         p, "zipfian", 0, 1000, 1000, new AcknowledgedCounterGenerator(1000));
   }
+
+  @Test
+  public void zipfianFixedSizeLastPartitionDoesNotCollapseToSingleKey() throws WorkloadException {
+    Properties p = new Properties();
+    p.setProperty(Client.OPERATION_COUNT_PROPERTY, "1000000000000");
+    p.setProperty(CoreWorkload.REQUEST_PARTITION_COUNT_PROPERTY, "20");
+    p.setProperty(CoreWorkload.REQUEST_PARTITION_INDEX_PROPERTY, "19");
+    p.setProperty(CoreWorkload.REQUEST_PARTITION_SIZE_PROPERTY, "100000000");
+
+    CoreWorkload.RequestDistributionState state =
+        CoreWorkload.createRequestDistributionState(
+            p,
+            "zipfian",
+            0,
+            1000000000000L,
+            1000000000000L,
+            new AcknowledgedCounterGenerator(1000000000000L));
+
+    assertEquals(999900000000L, state.lowerBound());
+    assertEquals(999999999999L, state.upperBound());
+    assertEquals("fixed-size shard 19/20 (shard=9999 size=100000000)", state.partitionDescription());
+  }
 }

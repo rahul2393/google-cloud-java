@@ -17,12 +17,14 @@
 package com.google.cloud.spanner.spi.v1;
 
 import com.google.api.gax.core.GaxProperties;
+import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.GlobalOpenTelemetry;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.metrics.DoubleHistogram;
 import io.opentelemetry.api.metrics.LongCounter;
 import io.opentelemetry.api.metrics.Meter;
+import io.opentelemetry.api.metrics.ObservableLongGauge;
 import io.opentelemetry.api.trace.Span;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -40,97 +42,8 @@ final class LocationAwareTelemetry {
   private static final AttributeKey<String> REASON_KEY = AttributeKey.stringKey("reason");
   private static final AttributeKey<String> DECISION_KEY = AttributeKey.stringKey("decision");
   private static final Set<EndpointStateProvider> PROVIDERS = ConcurrentHashMap.newKeySet();
-
-  private static final Meter METER =
-      GlobalOpenTelemetry.get()
-          .meterBuilder(INSTRUMENTATION_SCOPE)
-          .setInstrumentationVersion(GaxProperties.getLibraryVersion(LocationAwareTelemetry.class))
-          .build();
-  private static final LongCounter CACHE_UPDATE_COUNTER =
-      METER
-          .counterBuilder("location_aware.cache_update_count")
-          .setDescription("Number of location-aware cache updates received from routed requests.")
-          .setUnit("1")
-          .build();
-  private static final DoubleHistogram CACHE_UPDATE_PROCESSING_LATENCY =
-      METER
-          .histogramBuilder("location_aware.cache_update_processing_latency")
-          .setDescription("Time spent processing location-aware cache updates.")
-          .setUnit("ms")
-          .build();
-  private static final DoubleHistogram CACHE_UPDATE_QUEUE_LATENCY =
-      METER
-          .histogramBuilder("location_aware.cache_update_queue_latency")
-          .setDescription("Time a location-aware cache update spent waiting in the async queue.")
-          .setUnit("ms")
-          .build();
-  private static final LongCounter ENDPOINT_EVICTION_COUNTER =
-      METER
-          .counterBuilder("location_aware.endpoint_eviction_count")
-          .setDescription("Number of routed replica endpoints evicted by the lifecycle manager.")
-          .setUnit("1")
-          .build();
-  private static final LongCounter ENDPOINT_SKIP_COUNTER =
-      METER
-          .counterBuilder("location_aware.endpoint_skip_count")
-          .setDescription("Number of times location-aware routing skipped an endpoint.")
-          .setUnit("1")
-          .build();
-  private static final LongCounter ROUTING_DECISION_COUNTER =
-      METER
-          .counterBuilder("location_aware.routing_decision_count")
-          .setDescription(
-              "Final location-aware routing decision, including default-host fallback reasons.")
-          .setUnit("1")
-          .build();
-
-  static {
-    METER
-        .gaugeBuilder("location_aware.endpoint_state")
-        .ofLongs()
-        .setDescription("Current location-aware endpoint state by endpoint.")
-        .setUnit("1")
-        .buildWithCallback(
-            measurement ->
-                mergeEndpointStates()
-                    .forEach(
-                        (address, states) -> {
-                          if (address == null || address.isEmpty()) {
-                            return;
-                          }
-                          for (String state : states) {
-                            measurement.record(
-                                1L,
-                                Attributes.builder()
-                                    .put(TARGET_ENDPOINT_KEY, address)
-                                    .put(STATE_KEY, state)
-                                    .build());
-                          }
-                        }));
-    METER
-        .gaugeBuilder("location_aware.endpoint_state_count")
-        .ofLongs()
-        .setDescription("Current count of location-aware endpoint states by endpoint.")
-        .setUnit("1")
-        .buildWithCallback(
-            measurement -> {
-              mergeEndpointStates()
-                  .forEach(
-                      (address, states) -> {
-                        if (address == null || address.isEmpty()) {
-                          return;
-                        }
-                        for (String state : states) {
-                          measurement.record(
-                              1L,
-                              Attributes.builder()
-                                  .put(TARGET_ENDPOINT_KEY, address)
-                                  .put(STATE_KEY, state)
-                                  .build());
-                        }
-                      });
-            });
-  }
+  private static volatile TelemetryState telemetryState =
+      new TelemetryState(GlobalOpenTelemetry.get());
 
   private LocationAwareTelemetry() {}
 
@@ -151,7 +64,7 @@ final class LocationAwareTelemetry {
   }
 
   static void recordCacheUpdateReceived(@Nullable String targetEndpoint, @Nullable String method) {
-    CACHE_UPDATE_COUNTER.add(1L, requestAttributes(targetEndpoint, method));
+    telemetry().cacheUpdateCounter.add(1L, requestAttributes(targetEndpoint, method));
   }
 
   static void recordCacheUpdateProcessed(
@@ -164,8 +77,8 @@ final class LocationAwareTelemetry {
     double queueMs = nanosToMillis(processingStartedAtNanos - queuedAtNanos);
     double processingMs = nanosToMillis(processingCompletedAtNanos - processingStartedAtNanos);
     Attributes attributes = requestAttributes(targetEndpoint, method);
-    CACHE_UPDATE_QUEUE_LATENCY.record(queueMs, attributes);
-    CACHE_UPDATE_PROCESSING_LATENCY.record(processingMs, attributes);
+    telemetry().cacheUpdateQueueLatency.record(queueMs, attributes);
+    telemetry().cacheUpdateProcessingLatency.record(processingMs, attributes);
     if (span != null && span.getSpanContext().isValid()) {
       span.addEvent(
           "spanner.cache_update.processed",
@@ -184,7 +97,7 @@ final class LocationAwareTelemetry {
     if (address != null && !address.isEmpty()) {
       attributesBuilder.put(TARGET_ENDPOINT_KEY, address);
     }
-    ENDPOINT_EVICTION_COUNTER.add(1L, attributesBuilder.build());
+    telemetry().endpointEvictionCounter.add(1L, attributesBuilder.build());
   }
 
   static void recordEndpointSkipped(
@@ -197,7 +110,7 @@ final class LocationAwareTelemetry {
     if (targetEndpoint != null && !targetEndpoint.isEmpty()) {
       attributesBuilder.put(TARGET_ENDPOINT_KEY, targetEndpoint);
     }
-    ENDPOINT_SKIP_COUNTER.add(1L, attributesBuilder.build());
+    telemetry().endpointSkipCounter.add(1L, attributesBuilder.build());
   }
 
   static void recordRoutingDecision(
@@ -211,7 +124,7 @@ final class LocationAwareTelemetry {
     if (targetEndpoint != null && !targetEndpoint.isEmpty()) {
       attributesBuilder.put(TARGET_ENDPOINT_KEY, targetEndpoint);
     }
-    ROUTING_DECISION_COUNTER.add(1L, attributesBuilder.build());
+    telemetry().routingDecisionCounter.add(1L, attributesBuilder.build());
   }
 
   private static Attributes requestAttributes(
@@ -230,6 +143,23 @@ final class LocationAwareTelemetry {
     return nanos / 1_000_000d;
   }
 
+  private static TelemetryState telemetry() {
+    OpenTelemetry openTelemetry = GlobalOpenTelemetry.get();
+    TelemetryState currentState = telemetryState;
+    if (currentState.openTelemetry == openTelemetry) {
+      return currentState;
+    }
+    synchronized (LocationAwareTelemetry.class) {
+      currentState = telemetryState;
+      if (currentState.openTelemetry != openTelemetry) {
+        currentState.close();
+        currentState = new TelemetryState(openTelemetry);
+        telemetryState = currentState;
+      }
+      return currentState;
+    }
+  }
+
   private static Map<String, Set<String>> mergeEndpointStates() {
     Map<String, Set<String>> mergedStates = new HashMap<>();
     for (EndpointStateProvider provider : PROVIDERS) {
@@ -244,5 +174,108 @@ final class LocationAwareTelemetry {
               });
     }
     return mergedStates;
+  }
+
+  private static final class TelemetryState {
+    final OpenTelemetry openTelemetry;
+    final LongCounter cacheUpdateCounter;
+    final DoubleHistogram cacheUpdateProcessingLatency;
+    final DoubleHistogram cacheUpdateQueueLatency;
+    final LongCounter endpointEvictionCounter;
+    final LongCounter endpointSkipCounter;
+    final LongCounter routingDecisionCounter;
+    final ObservableLongGauge endpointStateGauge;
+    final ObservableLongGauge endpointStateCountGauge;
+
+    TelemetryState(OpenTelemetry openTelemetry) {
+      this.openTelemetry = openTelemetry;
+      Meter meter =
+          openTelemetry
+              .meterBuilder(INSTRUMENTATION_SCOPE)
+              .setInstrumentationVersion(
+                  GaxProperties.getLibraryVersion(LocationAwareTelemetry.class))
+              .build();
+      this.cacheUpdateCounter =
+          meter.counterBuilder("location_aware.cache_update_count")
+              .setDescription(
+                  "Number of location-aware cache updates received from routed requests.")
+              .setUnit("1")
+              .build();
+      this.cacheUpdateProcessingLatency =
+          meter.histogramBuilder("location_aware.cache_update_processing_latency")
+              .setDescription("Time spent processing location-aware cache updates.")
+              .setUnit("ms")
+              .build();
+      this.cacheUpdateQueueLatency =
+          meter.histogramBuilder("location_aware.cache_update_queue_latency")
+              .setDescription("Time a location-aware cache update spent waiting in the async queue.")
+              .setUnit("ms")
+              .build();
+      this.endpointEvictionCounter =
+          meter.counterBuilder("location_aware.endpoint_eviction_count")
+              .setDescription("Number of routed replica endpoints evicted by the lifecycle manager.")
+              .setUnit("1")
+              .build();
+      this.endpointSkipCounter =
+          meter.counterBuilder("location_aware.endpoint_skip_count")
+              .setDescription("Number of times location-aware routing skipped an endpoint.")
+              .setUnit("1")
+              .build();
+      this.routingDecisionCounter =
+          meter.counterBuilder("location_aware.routing_decision_count")
+              .setDescription(
+                  "Final location-aware routing decision, including default-host fallback reasons.")
+              .setUnit("1")
+              .build();
+      this.endpointStateGauge =
+          meter.gaugeBuilder("location_aware.endpoint_state")
+              .ofLongs()
+              .setDescription("Current location-aware endpoint state by endpoint.")
+              .setUnit("1")
+              .buildWithCallback(
+                  measurement ->
+                      mergeEndpointStates()
+                          .forEach(
+                              (address, states) -> {
+                                if (address == null || address.isEmpty()) {
+                                  return;
+                                }
+                                for (String state : states) {
+                                  measurement.record(
+                                      1L,
+                                      Attributes.builder()
+                                          .put(TARGET_ENDPOINT_KEY, address)
+                                          .put(STATE_KEY, state)
+                                          .build());
+                                }
+                              }));
+      this.endpointStateCountGauge =
+          meter.gaugeBuilder("location_aware.endpoint_state_count")
+              .ofLongs()
+              .setDescription("Current count of location-aware endpoint states by endpoint.")
+              .setUnit("1")
+              .buildWithCallback(
+                  measurement ->
+                      mergeEndpointStates()
+                          .forEach(
+                              (address, states) -> {
+                                if (address == null || address.isEmpty()) {
+                                  return;
+                                }
+                                for (String state : states) {
+                                  measurement.record(
+                                      1L,
+                                      Attributes.builder()
+                                          .put(TARGET_ENDPOINT_KEY, address)
+                                          .put(STATE_KEY, state)
+                                          .build());
+                                }
+                              }));
+    }
+
+    void close() {
+      endpointStateGauge.close();
+      endpointStateCountGauge.close();
+    }
   }
 }

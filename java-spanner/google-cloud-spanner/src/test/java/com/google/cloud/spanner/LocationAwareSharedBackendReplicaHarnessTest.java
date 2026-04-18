@@ -20,6 +20,7 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import com.google.cloud.NoCredentials;
@@ -50,7 +51,9 @@ import io.grpc.Metadata;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.protobuf.ProtoUtils;
+import io.opentelemetry.api.GlobalOpenTelemetry;
 import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
 import io.opentelemetry.sdk.metrics.SdkMeterProviderBuilder;
@@ -66,6 +69,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -80,6 +84,7 @@ public class LocationAwareSharedBackendReplicaHarnessTest {
   private static final String DATABASE = "fake-database";
   private static final String TABLE = "T";
   private static final String REPLICA_LOCATION = "us-east1";
+  private static final String STREAMING_READ_METHOD = "google.spanner.v1.Spanner/StreamingRead";
   private static final Statement SEED_QUERY = Statement.of("SELECT 1");
   private static final ByteString RESUME_TOKEN_AFTER_FIRST_ROW =
       ByteString.copyFromUtf8("000000001");
@@ -109,6 +114,11 @@ public class LocationAwareSharedBackendReplicaHarnessTest {
   @AfterClass
   public static void restoreEnvironment() {
     SpannerOptions.useDefaultEnvironment();
+  }
+
+  @After
+  public void resetGlobalTelemetry() {
+    GlobalOpenTelemetry.resetForTest();
   }
 
   @Test
@@ -221,6 +231,7 @@ public class LocationAwareSharedBackendReplicaHarnessTest {
                           && harness
                               .replicaAddresses
                               .get(0)
+                              .concat("-LEADER")
                               .equals(
                                   point
                                       .getAttributes()
@@ -234,6 +245,86 @@ public class LocationAwareSharedBackendReplicaHarnessTest {
           "Expected target_endpoint in built-in metrics points: "
               + operationCountMetric.getLongSumData().getPoints(),
           foundTargetEndpoint);
+    }
+  }
+
+  @Test
+  public void routingDecisionMetricsAreExportedToCustomerExporter() throws Exception {
+    InMemoryMetricReader metricReader = InMemoryMetricReader.create();
+    try (SharedBackendReplicaHarness harness = SharedBackendReplicaHarness.create(2);
+        Spanner spanner = createSpannerWithCustomExporter(harness, metricReader)) {
+      configureBackend(harness, singleRowReadResultSet("b"));
+      DatabaseClient client = spanner.getDatabaseClient(DatabaseId.of(PROJECT, INSTANCE, DATABASE));
+
+      MetricData routingDecisionMetric =
+          getMetricData(metricReader, "location_aware.routing_decision_count");
+      assertNull(routingDecisionMetric);
+
+      try (ResultSet firstRead =
+          client
+              .singleUse()
+              .read(
+                  TABLE,
+                  KeySet.singleKey(Key.of("b")),
+                  Arrays.asList("k"),
+                  Options.directedRead(DIRECTED_READ_OPTIONS))) {
+        assertTrue(firstRead.next());
+      }
+
+      seedLocationMetadata(client);
+      waitForReplicaRoutedRead(client, harness, 0);
+
+      try (ResultSet routedRead =
+          client
+              .singleUse()
+              .read(
+                  TABLE,
+                  KeySet.singleKey(Key.of("b")),
+                  Arrays.asList("k"),
+                  Options.directedRead(DIRECTED_READ_OPTIONS))) {
+        assertTrue(routedRead.next());
+      }
+
+      routingDecisionMetric = getMetricData(metricReader, "location_aware.routing_decision_count");
+      assertNotNull(routingDecisionMetric);
+      assertThat(routingDecisionMetric.getLongSumData().getPoints()).isNotEmpty();
+
+      AttributeKey<String> decisionKey = AttributeKey.stringKey("decision");
+      AttributeKey<String> reasonKey = AttributeKey.stringKey("reason");
+      AttributeKey<String> methodKey = AttributeKey.stringKey("method");
+      AttributeKey<String> endpointKey = AttributeKey.stringKey("target_endpoint");
+
+      boolean foundCacheMissDefaultHostDecision =
+          routingDecisionMetric.getLongSumData().getPoints().stream()
+              .anyMatch(
+                  point ->
+                      point.getValue() > 0
+                          && "default_host".equals(point.getAttributes().get(decisionKey))
+                          && "cache_miss".equals(point.getAttributes().get(reasonKey))
+                          && STREAMING_READ_METHOD.equals(point.getAttributes().get(methodKey))
+                          && harness.defaultAddress.equals(point.getAttributes().get(endpointKey)));
+      assertTrue(
+          "Expected default_host/cache_miss routing metric point: "
+              + routingDecisionMetric.getLongSumData().getPoints(),
+          foundCacheMissDefaultHostDecision);
+
+      boolean foundRoutedReplicaDecision =
+          routingDecisionMetric.getLongSumData().getPoints().stream()
+              .anyMatch(
+                  point ->
+                      point.getValue() > 0
+                          && "routed_replica".equals(point.getAttributes().get(decisionKey))
+                          && "selected".equals(point.getAttributes().get(reasonKey))
+                          && STREAMING_READ_METHOD.equals(point.getAttributes().get(methodKey))
+                          && harness
+                              .replicaAddresses
+                              .get(0)
+                              .concat("-LEADER")
+                              .equals(point.getAttributes().get(endpointKey)));
+      assertTrue(
+          "Expected routed_replica/selected routing metric point: "
+              + routingDecisionMetric.getLongSumData().getPoints(),
+          foundRoutedReplicaDecision);
     }
   }
 
@@ -621,11 +712,14 @@ public class LocationAwareSharedBackendReplicaHarnessTest {
 
   private static Spanner createSpannerWithCustomExporter(
       SharedBackendReplicaHarness harness, InMemoryMetricReader metricReader) {
+    GlobalOpenTelemetry.resetForTest();
     SdkMeterProviderBuilder meterProviderBuilder =
         SdkMeterProvider.builder().registerMetricReader(metricReader);
     SpannerOptions.registerBuiltInMetricViewsForCustomExporter(meterProviderBuilder);
     OpenTelemetry openTelemetry =
-        OpenTelemetrySdk.builder().setMeterProvider(meterProviderBuilder.build()).build();
+        OpenTelemetrySdk.builder()
+            .setMeterProvider(meterProviderBuilder.build())
+            .buildAndRegisterGlobal();
 
     return SpannerOptions.newBuilder()
         .usePlainText()

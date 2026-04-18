@@ -77,21 +77,32 @@ public final class KeyRangeCache {
 
   static final class RouteLookupResult {
     @javax.annotation.Nullable final ChannelEndpoint endpoint;
+    @javax.annotation.Nullable final String targetEndpointLabel;
     final RouteFailureReason failureReason;
 
     private RouteLookupResult(
-        @javax.annotation.Nullable ChannelEndpoint endpoint, RouteFailureReason failureReason) {
+        @javax.annotation.Nullable ChannelEndpoint endpoint,
+        @javax.annotation.Nullable String targetEndpointLabel,
+        RouteFailureReason failureReason) {
       this.endpoint = endpoint;
+      this.targetEndpointLabel = targetEndpointLabel;
       this.failureReason = failureReason;
     }
 
-    static RouteLookupResult routed(ChannelEndpoint endpoint) {
-      return new RouteLookupResult(endpoint, RouteFailureReason.NONE);
+    static RouteLookupResult routed(ChannelEndpoint endpoint, String targetEndpointLabel) {
+      return new RouteLookupResult(endpoint, targetEndpointLabel, RouteFailureReason.NONE);
     }
 
     static RouteLookupResult failed(RouteFailureReason failureReason) {
-      return new RouteLookupResult(null, failureReason);
+      return new RouteLookupResult(null, null, failureReason);
     }
+  }
+
+  static String formatTargetEndpointLabel(String address, boolean isLeader) {
+    if (address == null || address.isEmpty() || !isLeader) {
+      return address;
+    }
+    return address + "-LEADER";
   }
 
   private final ChannelEndpointCache endpointCache;
@@ -691,7 +702,8 @@ public final class KeyRangeCache {
           skippedTabletUids,
           resolvedEndpoints);
       hintBuilder.setTabletUid(selected.tabletUid);
-      return RouteLookupResult.routed(resolveEndpoint(selected, resolvedEndpoints));
+      return RouteLookupResult.routed(
+          resolveEndpoint(selected, resolvedEndpoints), endpointLabel(snapshot, selected));
     }
 
     private TabletSnapshot selectTablet(
@@ -712,6 +724,7 @@ public final class KeyRangeCache {
         checkedLeader = true;
         selectionStats.matchingReplicas++;
         if (!shouldSkip(
+            snapshot,
             snapshot.leader(),
             hintBuilder,
             excludedEndpoints,
@@ -731,6 +744,7 @@ public final class KeyRangeCache {
         }
         selectionStats.matchingReplicas++;
         if (shouldSkip(
+            snapshot,
             tablet,
             hintBuilder,
             excludedEndpoints,
@@ -757,7 +771,7 @@ public final class KeyRangeCache {
           continue;
         }
         recordKnownTransientFailure(
-            tablet, hintBuilder, excludedEndpoints, skippedTabletUids, resolvedEndpoints);
+            snapshot, tablet, hintBuilder, excludedEndpoints, skippedTabletUids, resolvedEndpoints);
       }
     }
 
@@ -770,16 +784,18 @@ public final class KeyRangeCache {
     }
 
     private boolean shouldSkip(
+        GroupSnapshot snapshot,
         TabletSnapshot tablet,
         RoutingHint.Builder hintBuilder,
         Predicate<String> excludedEndpoints,
         Set<Long> skippedTabletUids,
         Map<String, ChannelEndpoint> resolvedEndpoints,
         SelectionStats selectionStats) {
+      String targetEndpointLabel = endpointLabel(snapshot, tablet);
       if (tablet.skip) {
         selectionStats.tabletMarkedSkipCount++;
         LocationAwareTelemetry.recordEndpointSkipped(
-            tablet.serverAddress, null, "tablet_marked_skip");
+            targetEndpointLabel, null, "tablet_marked_skip");
         addSkippedTablet(tablet, hintBuilder, skippedTabletUids);
         return true;
       }
@@ -793,7 +809,7 @@ public final class KeyRangeCache {
         selectionStats.excludedCount++;
         // Request-scoped exclusions are used for retry/cooldown decisions such as
         // UNAVAILABLE/RESOURCE_EXHAUSTED and must not populate skipped_tablet_uid.
-        LocationAwareTelemetry.recordEndpointSkipped(tablet.serverAddress, null, "excluded");
+        LocationAwareTelemetry.recordEndpointSkipped(targetEndpointLabel, null, "excluded");
         return true;
       }
 
@@ -801,7 +817,7 @@ public final class KeyRangeCache {
       if (endpoint == null) {
         selectionStats.missingEndpointCount++;
         LocationAwareTelemetry.recordEndpointSkipped(
-            tablet.serverAddress, null, "missing_endpoint");
+            targetEndpointLabel, null, "missing_endpoint");
         logger.log(
             Level.FINE,
             "Tablet {0} at {1}: no endpoint present, skipping silently",
@@ -818,7 +834,7 @@ public final class KeyRangeCache {
       if (endpoint.isTransientFailure()) {
         selectionStats.transientFailureCount++;
         LocationAwareTelemetry.recordEndpointSkipped(
-            tablet.serverAddress, null, "transient_failure");
+            targetEndpointLabel, null, "transient_failure");
         logger.log(
             Level.FINE,
             "Tablet {0} at {1}: endpoint in TRANSIENT_FAILURE, adding to skipped_tablets",
@@ -828,7 +844,7 @@ public final class KeyRangeCache {
       }
 
       selectionStats.notReadyCount++;
-      LocationAwareTelemetry.recordEndpointSkipped(tablet.serverAddress, null, "not_ready");
+      LocationAwareTelemetry.recordEndpointSkipped(targetEndpointLabel, null, "not_ready");
       logger.log(
           Level.FINE,
           "Tablet {0} at {1}: endpoint not ready, skipping silently",
@@ -864,6 +880,7 @@ public final class KeyRangeCache {
     }
 
     private void recordKnownTransientFailure(
+        GroupSnapshot snapshot,
         TabletSnapshot tablet,
         RoutingHint.Builder hintBuilder,
         Predicate<String> excludedEndpoints,
@@ -878,12 +895,17 @@ public final class KeyRangeCache {
       ChannelEndpoint endpoint = resolveEndpoint(tablet, resolvedEndpoints);
       if (endpoint != null && endpoint.isTransientFailure()) {
         LocationAwareTelemetry.recordEndpointSkipped(
-            tablet.serverAddress, null, "known_transient_failure");
+            endpointLabel(snapshot, tablet), null, "known_transient_failure");
         addSkippedTablet(tablet, hintBuilder, skippedTabletUids);
         return;
       }
 
       maybeAddRecentTransientFailureSkip(tablet, hintBuilder, skippedTabletUids);
+    }
+
+    private String endpointLabel(GroupSnapshot snapshot, TabletSnapshot tablet) {
+      return formatTargetEndpointLabel(
+          tablet.serverAddress, snapshot.hasLeader() && snapshot.leader() == tablet);
     }
 
     private ChannelEndpoint resolveEndpoint(

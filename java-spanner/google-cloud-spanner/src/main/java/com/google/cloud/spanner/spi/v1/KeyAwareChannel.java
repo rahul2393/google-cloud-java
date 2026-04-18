@@ -578,6 +578,7 @@ final class KeyAwareChannel extends ManagedChannel {
     private ChannelFinder channelFinder;
     @Nullable private Predicate<String> excludedEndpoints;
     @Nullable private ChannelEndpoint selectedEndpoint;
+    @Nullable private String selectedTargetEndpointLabel;
     @Nullable private ByteString transactionIdToClear;
     private boolean allowDefaultAffinity;
     private long pendingRequests;
@@ -647,6 +648,7 @@ final class KeyAwareChannel extends ManagedChannel {
         ChannelFinder finder = null;
         String routingDecisionLabel = "default_host";
         String routingReasonLabel = "unknown";
+        String targetEndpointLabel = null;
 
         if (message instanceof ReadRequest) {
           ReadRequest.Builder reqBuilder = ((ReadRequest) message).toBuilder();
@@ -656,6 +658,7 @@ final class KeyAwareChannel extends ManagedChannel {
           endpoint = routing.endpoint;
           routingDecisionLabel = routing.decision;
           routingReasonLabel = routing.reason;
+          targetEndpointLabel = routing.targetEndpointLabel;
           message = (RequestT) reqBuilder.build();
         } else if (message instanceof ExecuteSqlRequest) {
           ExecuteSqlRequest.Builder reqBuilder = ((ExecuteSqlRequest) message).toBuilder();
@@ -665,6 +668,7 @@ final class KeyAwareChannel extends ManagedChannel {
           endpoint = routing.endpoint;
           routingDecisionLabel = routing.decision;
           routingReasonLabel = routing.reason;
+          targetEndpointLabel = routing.targetEndpointLabel;
           message = (RequestT) reqBuilder.build();
         } else if (message instanceof BeginTransactionRequest) {
           BeginTransactionRequest.Builder reqBuilder =
@@ -680,6 +684,7 @@ final class KeyAwareChannel extends ManagedChannel {
             if (endpoint != null) {
               routingDecisionLabel = "routed_replica";
               routingReasonLabel = "selected";
+              targetEndpointLabel = routeLookup.targetEndpointLabel;
             } else {
               routingReasonLabel = routeFailureReasonLabel(routeLookup.failureReason);
             }
@@ -710,6 +715,7 @@ final class KeyAwareChannel extends ManagedChannel {
             if (endpoint != null) {
               routingDecisionLabel = "routed_replica";
               routingReasonLabel = "selected";
+              targetEndpointLabel = routeLookup.targetEndpointLabel;
             } else {
               routingReasonLabel = routeFailureReasonLabel(routeLookup.failureReason);
             }
@@ -726,6 +732,7 @@ final class KeyAwareChannel extends ManagedChannel {
               endpoint = affinityEndpoint;
               routingDecisionLabel = "affinity";
               routingReasonLabel = "selected";
+              targetEndpointLabel = affinityEndpoint.getAddress();
             }
             transactionIdToClear = request.getTransactionId();
           }
@@ -740,6 +747,7 @@ final class KeyAwareChannel extends ManagedChannel {
             if (endpoint != null) {
               routingDecisionLabel = "affinity";
               routingReasonLabel = "selected";
+              targetEndpointLabel = endpoint.getAddress();
             } else {
               routingReasonLabel = "no_affinity_endpoint";
             }
@@ -759,18 +767,22 @@ final class KeyAwareChannel extends ManagedChannel {
         if (endpoint == null) {
           throw new IllegalStateException("No default endpoint available for key-aware call");
         }
+        if (targetEndpointLabel == null) {
+          targetEndpointLabel = endpoint.getAddress();
+        }
         if (!parentChannel.defaultEndpointAddress.equals(endpoint.getAddress())) {
           LocationAwareTelemetry.recordRoutingDecision(
-              routingDecisionLabel, routingReasonLabel, endpoint.getAddress(),
+              routingDecisionLabel, routingReasonLabel, targetEndpointLabel,
               methodDescriptor.getFullMethodName());
         } else {
           LocationAwareTelemetry.recordRoutingDecision(
               "default_host",
               routingReasonLabel,
-              endpoint.getAddress(),
+              targetEndpointLabel,
               methodDescriptor.getFullMethodName());
         }
         selectedEndpoint = endpoint;
+        selectedTargetEndpointLabel = targetEndpointLabel;
         this.channelFinder = finder;
 
         // Record real traffic for idle eviction tracking.
@@ -778,13 +790,13 @@ final class KeyAwareChannel extends ManagedChannel {
 
         XGoogSpannerRequestId requestId = callOptions.getOption(REQUEST_ID_CALL_OPTIONS_KEY);
         if (requestId != null) {
-          RequestIdTargetTracker.record(requestId.getHeaderValue(), endpoint.getAddress());
+          RequestIdTargetTracker.record(requestId.getHeaderValue(), targetEndpointLabel);
         }
         ApiTracer tracer = callOptions.getOption(TRACER_KEY);
         if (tracer instanceof CompositeTracer) {
           ((CompositeTracer) tracer)
               .addAttributes(
-                  BuiltInMetricsConstant.TARGET_ENDPOINT_KEY.getKey(), endpoint.getAddress());
+                  BuiltInMetricsConstant.TARGET_ENDPOINT_KEY.getKey(), targetEndpointLabel);
         }
         long routeSelectionCompletedAtNanos = System.nanoTime();
         recordRouteSelectionTrace(
@@ -962,10 +974,11 @@ final class KeyAwareChannel extends ManagedChannel {
       String decision = "default_host";
       String reason = "unknown";
       if (endpoint != null) {
-        return new RoutingDecision(null, endpoint, "affinity", "selected");
+        return new RoutingDecision(
+            null, endpoint, endpoint.getAddress(), "affinity", "selected");
       }
       if (databaseId == null) {
-        return new RoutingDecision(null, null, decision, "missing_database_id");
+        return new RoutingDecision(null, null, null, decision, "missing_database_id");
       }
       if (databaseId != null) {
         finder = parentChannel.getOrCreateChannelFinder(databaseId);
@@ -980,11 +993,13 @@ final class KeyAwareChannel extends ManagedChannel {
         if (endpoint != null) {
           decision = "routed_replica";
           reason = "selected";
+          return new RoutingDecision(
+              finder, endpoint, routed.targetEndpointLabel, decision, reason);
         } else {
           reason = routeFailureReasonLabel(routed.failureReason);
         }
       }
-      return new RoutingDecision(finder, endpoint, decision, reason);
+      return new RoutingDecision(finder, endpoint, null, decision, reason);
     }
 
     private RoutingDecision routeFromRequest(ExecuteSqlRequest.Builder reqBuilder) {
@@ -999,10 +1014,11 @@ final class KeyAwareChannel extends ManagedChannel {
       String decision = "default_host";
       String reason = "unknown";
       if (endpoint != null) {
-        return new RoutingDecision(null, endpoint, "affinity", "selected");
+        return new RoutingDecision(
+            null, endpoint, endpoint.getAddress(), "affinity", "selected");
       }
       if (databaseId == null) {
-        return new RoutingDecision(null, null, decision, "missing_database_id");
+        return new RoutingDecision(null, null, null, decision, "missing_database_id");
       }
       if (databaseId != null) {
         finder = parentChannel.getOrCreateChannelFinder(databaseId);
@@ -1017,18 +1033,20 @@ final class KeyAwareChannel extends ManagedChannel {
         if (endpoint != null) {
           decision = "routed_replica";
           reason = "selected";
+          return new RoutingDecision(
+              finder, endpoint, routed.targetEndpointLabel, decision, reason);
         } else {
           reason = routeFailureReasonLabel(routed.failureReason);
         }
       }
-      return new RoutingDecision(finder, endpoint, decision, reason);
+      return new RoutingDecision(finder, endpoint, null, decision, reason);
     }
 
     private void enqueueCacheUpdate(com.google.spanner.v1.CacheUpdate cacheUpdate) {
       if (channelFinder == null) {
         return;
       }
-      String targetEndpoint = selectedEndpoint == null ? null : selectedEndpoint.getAddress();
+      String targetEndpoint = selectedTargetEndpointLabel;
       String method = methodDescriptor.getFullMethodName();
       Span span = Span.current();
       LocationAwareTelemetry.recordCacheUpdateReceived(targetEndpoint, method);
@@ -1039,16 +1057,19 @@ final class KeyAwareChannel extends ManagedChannel {
   private static final class RoutingDecision {
     @Nullable private final ChannelFinder finder;
     @Nullable private final ChannelEndpoint endpoint;
+    @Nullable private final String targetEndpointLabel;
     private final String decision;
     private final String reason;
 
     private RoutingDecision(
         @Nullable ChannelFinder finder,
         @Nullable ChannelEndpoint endpoint,
+        @Nullable String targetEndpointLabel,
         String decision,
         String reason) {
       this.finder = finder;
       this.endpoint = endpoint;
+      this.targetEndpointLabel = targetEndpointLabel;
       this.decision = decision;
       this.reason = reason;
     }

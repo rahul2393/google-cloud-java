@@ -134,8 +134,7 @@ public class GrpcResultSetTest {
   @Test
   public void tracesSlowQueueResidenceAndRowMaterialization() {
     ISpan localTraceSpan = org.mockito.Mockito.mock(ISpan.class);
-    LongSupplier sequenceNanoClock =
-        org.mockito.Mockito.mock(LongSupplier.class);
+    LongSupplier sequenceNanoClock = org.mockito.Mockito.mock(LongSupplier.class);
     org.mockito.Mockito.when(sequenceNanoClock.getAsLong())
         .thenReturn(
             0L,
@@ -192,8 +191,7 @@ public class GrpcResultSetTest {
     assertThat(localResultSet.getString(0)).isEqualTo("a");
 
     verify(localTraceSpan).addAnnotation(eq("Stream queue handed off PartialResultSet"), anyMap());
-    verify(localTraceSpan, atLeastOnce())
-        .addAnnotation(eq("ResultSet row materialized"), anyMap());
+    verify(localTraceSpan, atLeastOnce()).addAnnotation(eq("ResultSet row materialized"), anyMap());
   }
 
   @Test

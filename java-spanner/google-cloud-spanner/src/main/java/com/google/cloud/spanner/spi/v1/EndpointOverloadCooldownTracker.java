@@ -20,6 +20,8 @@ import com.google.common.annotations.VisibleForTesting;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.LongUnaryOperator;
@@ -133,17 +135,21 @@ final class EndpointOverloadCooldownTracker {
   }
 
   int activeCooldownCount() {
+    return snapshotCoolingDownAddresses().size();
+  }
+
+  Set<String> snapshotCoolingDownAddresses() {
     Instant now = clock.instant();
-    int count = 0;
+    Set<String> addresses = new HashSet<>();
     for (java.util.Map.Entry<String, CooldownState> entry : entries.entrySet()) {
       CooldownState state = entry.getValue();
       if (state.cooldownUntil.isAfter(now)) {
-        count++;
+        addresses.add(entry.getKey());
       } else if (Duration.between(state.lastFailureAt, now).compareTo(resetAfter) >= 0) {
         entries.remove(entry.getKey(), state);
       }
     }
-    return count;
+    return addresses;
   }
 
   private Duration cooldownForFailures(int failures) {

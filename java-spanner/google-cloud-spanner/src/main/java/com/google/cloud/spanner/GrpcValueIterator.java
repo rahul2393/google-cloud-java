@@ -39,8 +39,8 @@ import javax.annotation.Nullable;
 
 /** Adapts a stream of {@code PartialResultSet} messages into a stream of {@code Value} messages. */
 class GrpcValueIterator extends AbstractIterator<com.google.protobuf.Value> {
-  @VisibleForTesting static final long SLOW_PARTIAL_RESULT_SET_EVENT_NANOS =
-      TimeUnit.MILLISECONDS.toNanos(1L);
+  @VisibleForTesting
+  static final long SLOW_PARTIAL_RESULT_SET_EVENT_NANOS = TimeUnit.MILLISECONDS.toNanos(1L);
 
   private enum StreamValue {
     METADATA,

@@ -50,7 +50,8 @@ public class BuiltInMetricsToCustomOpenTelemetryTest extends AbstractNettyMockSe
       OAuth2Credentials.create(
           new AccessToken(
               "TEST_TOKEN",
-              new Date(System.currentTimeMillis() + java.util.concurrent.TimeUnit.DAYS.toMillis(1))));
+              new Date(
+                  System.currentTimeMillis() + java.util.concurrent.TimeUnit.DAYS.toMillis(1))));
   private static final ResultSetMetadata SELECT1_METADATA =
       ResultSetMetadata.newBuilder()
           .setRowType(
@@ -59,7 +60,9 @@ public class BuiltInMetricsToCustomOpenTelemetryTest extends AbstractNettyMockSe
                       StructType.Field.newBuilder()
                           .setName("COL1")
                           .setType(
-                              com.google.spanner.v1.Type.newBuilder().setCode(TypeCode.INT64).build())
+                              com.google.spanner.v1.Type.newBuilder()
+                                  .setCode(TypeCode.INT64)
+                                  .build())
                           .build())
                   .build())
           .build();
@@ -87,7 +90,8 @@ public class BuiltInMetricsToCustomOpenTelemetryTest extends AbstractNettyMockSe
     globalMetricReader = InMemoryMetricReader.create();
     GlobalOpenTelemetry.resetForTest();
     OpenTelemetrySdk.builder()
-        .setMeterProvider(SdkMeterProvider.builder().registerMetricReader(globalMetricReader).build())
+        .setMeterProvider(
+            SdkMeterProvider.builder().registerMetricReader(globalMetricReader).build())
         .buildAndRegisterGlobal();
 
     injectedMetricReader = InMemoryMetricReader.create();
@@ -140,16 +144,21 @@ public class BuiltInMetricsToCustomOpenTelemetryTest extends AbstractNettyMockSe
                     point ->
                         point.getValue() > 0
                             && "Spanner.ExecuteStreamingSql"
-                                .equals(point.getAttributes().get(BuiltInMetricsConstant.METHOD_KEY))
+                                .equals(
+                                    point.getAttributes().get(BuiltInMetricsConstant.METHOD_KEY))
                             && "OK"
-                                .equals(point.getAttributes().get(BuiltInMetricsConstant.STATUS_KEY))
+                                .equals(
+                                    point.getAttributes().get(BuiltInMetricsConstant.STATUS_KEY))
                             && "ycsb/test-pod-1"
                                 .equals(
                                     point
                                         .getAttributes()
                                         .get(BuiltInMetricsConstant.CLIENT_NAME_KEY))
                             && "d"
-                                .equals(point.getAttributes().get(BuiltInMetricsConstant.DATABASE_KEY))))
+                                .equals(
+                                    point
+                                        .getAttributes()
+                                        .get(BuiltInMetricsConstant.DATABASE_KEY))))
         .isTrue();
 
     MetricData globalOperationCount =
@@ -169,6 +178,9 @@ public class BuiltInMetricsToCustomOpenTelemetryTest extends AbstractNettyMockSe
 
   private MetricData getMetricData(InMemoryMetricReader reader, String metricName) {
     Collection<MetricData> metrics = reader.collectAllMetrics();
-    return metrics.stream().filter(metric -> metric.getName().equals(metricName)).findFirst().orElse(null);
+    return metrics.stream()
+        .filter(metric -> metric.getName().equals(metricName))
+        .findFirst()
+        .orElse(null);
   }
 }

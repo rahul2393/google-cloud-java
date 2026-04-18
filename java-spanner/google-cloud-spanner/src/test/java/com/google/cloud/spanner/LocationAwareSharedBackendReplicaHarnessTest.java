@@ -16,8 +16,10 @@
 
 package com.google.cloud.spanner;
 
+import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
 import com.google.cloud.NoCredentials;
@@ -48,8 +50,15 @@ import io.grpc.Metadata;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.protobuf.ProtoUtils;
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.metrics.SdkMeterProviderBuilder;
+import io.opentelemetry.sdk.metrics.data.MetricData;
+import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -170,6 +179,61 @@ public class LocationAwareSharedBackendReplicaHarnessTest {
               .get(1)
               .getRequestIds(SharedBackendReplicaHarness.METHOD_STREAMING_READ)
               .get(0));
+    }
+  }
+
+  @Test
+  public void builtInMetricsCustomExporterIncludesTargetEndpointForBypassTraffic()
+      throws Exception {
+    InMemoryMetricReader metricReader = InMemoryMetricReader.create();
+    try (SharedBackendReplicaHarness harness = SharedBackendReplicaHarness.create(2);
+        Spanner spanner = createSpannerWithCustomExporter(harness, metricReader)) {
+      configureBackend(harness, singleRowReadResultSet("b"));
+      DatabaseClient client = spanner.getDatabaseClient(DatabaseId.of(PROJECT, INSTANCE, DATABASE));
+
+      seedLocationMetadata(client);
+      waitForReplicaRoutedRead(client, harness, 0);
+
+      try (ResultSet resultSet =
+          client
+              .singleUse()
+              .read(
+                  TABLE,
+                  KeySet.singleKey(Key.of("b")),
+                  Arrays.asList("k"),
+                  Options.directedRead(DIRECTED_READ_OPTIONS))) {
+        assertTrue(resultSet.next());
+      }
+
+      MetricData operationCountMetric =
+          getMetricData(
+              metricReader,
+              BuiltInMetricsConstant.CUSTOM_EXPORT_METER_NAME
+                  + "/"
+                  + BuiltInMetricsConstant.OPERATION_COUNT_NAME);
+      assertNotNull(operationCountMetric);
+      assertThat(operationCountMetric.getLongSumData().getPoints()).isNotEmpty();
+      boolean foundTargetEndpoint =
+          operationCountMetric.getLongSumData().getPoints().stream()
+              .anyMatch(
+                  point ->
+                      point.getValue() > 0
+                          && harness
+                              .replicaAddresses
+                              .get(0)
+                              .equals(
+                                  point
+                                      .getAttributes()
+                                      .get(BuiltInMetricsConstant.TARGET_ENDPOINT_KEY))
+                          && "ycsb/test-pod-1"
+                              .equals(
+                                  point.getAttributes().get(BuiltInMetricsConstant.CLIENT_NAME_KEY))
+                          && DATABASE.equals(
+                              point.getAttributes().get(BuiltInMetricsConstant.DATABASE_KEY)));
+      assertTrue(
+          "Expected target_endpoint in built-in metrics points: "
+              + operationCountMetric.getLongSumData().getPoints(),
+          foundTargetEndpoint);
     }
   }
 
@@ -555,6 +619,28 @@ public class LocationAwareSharedBackendReplicaHarnessTest {
     return builder.build().getService();
   }
 
+  private static Spanner createSpannerWithCustomExporter(
+      SharedBackendReplicaHarness harness, InMemoryMetricReader metricReader) {
+    SdkMeterProviderBuilder meterProviderBuilder =
+        SdkMeterProvider.builder().registerMetricReader(metricReader);
+    SpannerOptions.registerBuiltInMetricViewsForCustomExporter(meterProviderBuilder);
+    OpenTelemetry openTelemetry =
+        OpenTelemetrySdk.builder().setMeterProvider(meterProviderBuilder.build()).build();
+
+    return SpannerOptions.newBuilder()
+        .usePlainText()
+        .setExperimentalHost(harness.defaultAddress)
+        .setProjectId(PROJECT)
+        .setCredentials(NoCredentials.getInstance())
+        .setChannelEndpointCacheFactory(null)
+        .setBuiltInMetricsEnabled(false)
+        .setOpenTelemetry(openTelemetry)
+        .setExportBuiltInMetricsToOpenTelemetry(true)
+        .setBuiltInMetricsClientName("ycsb/test-pod-1")
+        .build()
+        .getService();
+  }
+
   private static void configureBackend(
       SharedBackendReplicaHarness harness, com.google.spanner.v1.ResultSet readResultSet)
       throws TextFormat.ParseException {
@@ -719,6 +805,14 @@ public class LocationAwareSharedBackendReplicaHarnessTest {
 
   private static com.google.spanner.v1.ResultSet multiRowReadResultSet(String... values) {
     return readResultSet(Arrays.asList(values));
+  }
+
+  private static MetricData getMetricData(InMemoryMetricReader reader, String metricName) {
+    Collection<MetricData> metrics = reader.collectAllMetrics();
+    return metrics.stream()
+        .filter(metric -> metric.getName().equals(metricName))
+        .findFirst()
+        .orElse(null);
   }
 
   private static com.google.spanner.v1.ResultSet readResultSet(List<String> values) {

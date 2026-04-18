@@ -25,6 +25,7 @@ import io.opentelemetry.api.metrics.LongCounter;
 import io.opentelemetry.api.metrics.Meter;
 import io.opentelemetry.api.trace.Span;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -45,27 +46,59 @@ final class LocationAwareTelemetry {
           .setInstrumentationVersion(GaxProperties.getLibraryVersion(LocationAwareTelemetry.class))
           .build();
   private static final LongCounter CACHE_UPDATE_COUNTER =
-      METER.counterBuilder("location_aware.cache_update_count")
+      METER
+          .counterBuilder("location_aware.cache_update_count")
           .setDescription("Number of location-aware cache updates received from routed requests.")
           .setUnit("1")
           .build();
   private static final DoubleHistogram CACHE_UPDATE_PROCESSING_LATENCY =
-      METER.histogramBuilder("location_aware.cache_update_processing_latency")
+      METER
+          .histogramBuilder("location_aware.cache_update_processing_latency")
           .setDescription("Time spent processing location-aware cache updates.")
           .setUnit("ms")
           .build();
   private static final DoubleHistogram CACHE_UPDATE_QUEUE_LATENCY =
-      METER.histogramBuilder("location_aware.cache_update_queue_latency")
+      METER
+          .histogramBuilder("location_aware.cache_update_queue_latency")
           .setDescription("Time a location-aware cache update spent waiting in the async queue.")
           .setUnit("ms")
           .build();
   private static final LongCounter ENDPOINT_EVICTION_COUNTER =
-      METER.counterBuilder("location_aware.endpoint_eviction_count")
+      METER
+          .counterBuilder("location_aware.endpoint_eviction_count")
           .setDescription("Number of routed replica endpoints evicted by the lifecycle manager.")
+          .setUnit("1")
+          .build();
+  private static final LongCounter ENDPOINT_SKIP_COUNTER =
+      METER
+          .counterBuilder("location_aware.endpoint_skip_count")
+          .setDescription("Number of times location-aware routing skipped an endpoint.")
           .setUnit("1")
           .build();
 
   static {
+    METER
+        .gaugeBuilder("location_aware.endpoint_state")
+        .ofLongs()
+        .setDescription("Current location-aware endpoint state by endpoint.")
+        .setUnit("1")
+        .buildWithCallback(
+            measurement ->
+                mergeEndpointStates()
+                    .forEach(
+                        (address, states) -> {
+                          if (address == null || address.isEmpty()) {
+                            return;
+                          }
+                          for (String state : states) {
+                            measurement.record(
+                                1L,
+                                Attributes.builder()
+                                    .put(TARGET_ENDPOINT_KEY, address)
+                                    .put(STATE_KEY, state)
+                                    .build());
+                          }
+                        }));
     METER
         .gaugeBuilder("location_aware.endpoint_state_count")
         .ofLongs()
@@ -74,10 +107,14 @@ final class LocationAwareTelemetry {
         .buildWithCallback(
             measurement -> {
               Map<String, Long> counts = new HashMap<>();
-              for (EndpointStateProvider provider : PROVIDERS) {
-                provider.snapshotEndpointStateCounts().forEach(
-                    (state, count) -> counts.merge(state, count, Long::sum));
-              }
+              mergeEndpointStates()
+                  .values()
+                  .forEach(
+                      states -> {
+                        for (String state : states) {
+                          counts.merge(state, 1L, Long::sum);
+                        }
+                      });
               counts.forEach(
                   (state, count) -> measurement.record(count, Attributes.of(STATE_KEY, state)));
             });
@@ -86,7 +123,7 @@ final class LocationAwareTelemetry {
   private LocationAwareTelemetry() {}
 
   interface EndpointStateProvider {
-    Map<String, Long> snapshotEndpointStateCounts();
+    Map<String, Set<String>> snapshotEndpointStates();
   }
 
   static void registerEndpointStateProvider(EndpointStateProvider provider) {
@@ -138,6 +175,19 @@ final class LocationAwareTelemetry {
     ENDPOINT_EVICTION_COUNTER.add(1L, attributesBuilder.build());
   }
 
+  static void recordEndpointSkipped(
+      @Nullable String targetEndpoint, @Nullable String method, String reason) {
+    io.opentelemetry.api.common.AttributesBuilder attributesBuilder = Attributes.builder();
+    attributesBuilder.put(REASON_KEY, reason == null ? "unknown" : reason);
+    if (method != null && !method.isEmpty()) {
+      attributesBuilder.put(METHOD_KEY, method);
+    }
+    if (targetEndpoint != null && !targetEndpoint.isEmpty()) {
+      attributesBuilder.put(TARGET_ENDPOINT_KEY, targetEndpoint);
+    }
+    ENDPOINT_SKIP_COUNTER.add(1L, attributesBuilder.build());
+  }
+
   private static Attributes requestAttributes(
       @Nullable String targetEndpoint, @Nullable String method) {
     io.opentelemetry.api.common.AttributesBuilder attributesBuilder = Attributes.builder();
@@ -152,5 +202,21 @@ final class LocationAwareTelemetry {
 
   private static double nanosToMillis(long nanos) {
     return nanos / 1_000_000d;
+  }
+
+  private static Map<String, Set<String>> mergeEndpointStates() {
+    Map<String, Set<String>> mergedStates = new HashMap<>();
+    for (EndpointStateProvider provider : PROVIDERS) {
+      provider
+          .snapshotEndpointStates()
+          .forEach(
+              (address, states) -> {
+                if (address == null || address.isEmpty() || states == null || states.isEmpty()) {
+                  return;
+                }
+                mergedStates.computeIfAbsent(address, ignored -> new HashSet<>()).addAll(states);
+              });
+    }
+    return mergedStates;
   }
 }

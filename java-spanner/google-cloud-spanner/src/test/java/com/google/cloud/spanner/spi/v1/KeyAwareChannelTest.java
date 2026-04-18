@@ -66,8 +66,8 @@ import io.opentelemetry.sdk.trace.SdkTracerProvider;
 import io.opentelemetry.sdk.trace.data.EventData;
 import io.opentelemetry.sdk.trace.data.SpanData;
 import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
-import java.net.InetSocketAddress;
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -300,7 +300,8 @@ public class KeyAwareChannelTest {
         responseHeaders.put(Metadata.Key.of("server", Metadata.ASCII_STRING_MARSHALLER), "test");
         tracer.inboundHeaders(responseHeaders);
         Metadata trailers = new Metadata();
-        trailers.put(Metadata.Key.of("grpc-status-details-bin", Metadata.BINARY_BYTE_MARSHALLER),
+        trailers.put(
+            Metadata.Key.of("grpc-status-details-bin", Metadata.BINARY_BYTE_MARSHALLER),
             new byte[] {1});
         tracer.inboundTrailers(trailers);
       } finally {

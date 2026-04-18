@@ -25,9 +25,9 @@ import com.google.protobuf.Value;
 import com.google.spanner.v1.PartialResultSet;
 import com.google.spanner.v1.ResultSetMetadata;
 import com.google.spanner.v1.ResultSetStats;
-import java.util.HashMap;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -37,8 +37,8 @@ import javax.annotation.Nullable;
 @VisibleForTesting
 class GrpcResultSet extends AbstractResultSet<List<Object>>
     implements ProtobufResultSet, StreamingResultSet {
-  @VisibleForTesting static final long SLOW_ROW_MATERIALIZATION_EVENT_NANOS =
-      TimeUnit.MILLISECONDS.toNanos(1L);
+  @VisibleForTesting
+  static final long SLOW_ROW_MATERIALIZATION_EVENT_NANOS = TimeUnit.MILLISECONDS.toNanos(1L);
 
   private final GrpcValueIterator iterator;
   private final Listener listener;

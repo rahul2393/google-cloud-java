@@ -79,7 +79,6 @@ public class KeyRangeCacheTest {
     assertNotNull(server);
     assertEquals("server2", server.getAddress());
     assertEquals(1, hint.getSkippedTabletUidCount());
-    assertEquals(1L, hint.getSkippedTabletUid(0).getTabletUid());
   }
 
   @Test
@@ -130,8 +129,7 @@ public class KeyRangeCacheTest {
 
     assertNotNull(server);
     assertEquals("server2", server.getAddress());
-    assertEquals(1, hint.getSkippedTabletUidCount());
-    assertEquals(1L, hint.getSkippedTabletUid(0).getTabletUid());
+    assertEquals(0, hint.getSkippedTabletUidCount());
   }
 
   @Test
@@ -346,6 +344,28 @@ public class KeyRangeCacheTest {
             KeyRangeCache.RangeMode.COVERING_SPLIT,
             DirectedReadOptions.getDefaultInstance(),
             hint);
+
+    assertNull(server);
+    assertEquals(0, hint.getSkippedTabletUidCount());
+  }
+
+  @Test
+  public void excludedEndpointDoesNotAddSkippedTablet() {
+    FakeEndpointCache endpointCache = new FakeEndpointCache();
+    KeyRangeCache cache = new KeyRangeCache(endpointCache);
+    cache.addRanges(singleReplicaUpdate("server1"));
+
+    endpointCache.get("server1");
+    endpointCache.setState("server1", EndpointHealthState.READY);
+
+    RoutingHint.Builder hint = RoutingHint.newBuilder().setKey(bytes("a"));
+    ChannelEndpoint server =
+        cache.fillRoutingHint(
+            false,
+            KeyRangeCache.RangeMode.COVERING_SPLIT,
+            DirectedReadOptions.getDefaultInstance(),
+            hint,
+            "server1"::equals);
 
     assertNull(server);
     assertEquals(0, hint.getSkippedTabletUidCount());

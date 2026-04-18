@@ -25,12 +25,18 @@ import javax.annotation.Nullable;
 final class RequestIdTargetTracker {
 
   private static final Cache<String, String> TARGETS =
-      CacheBuilder.newBuilder().maximumSize(100_000L).expireAfterWrite(10, TimeUnit.MINUTES).build();
+      CacheBuilder.newBuilder()
+          .maximumSize(100_000L)
+          .expireAfterWrite(10, TimeUnit.MINUTES)
+          .build();
 
   private RequestIdTargetTracker() {}
 
   static void record(String requestId, String targetEndpoint) {
-    if (requestId == null || requestId.isEmpty() || targetEndpoint == null || targetEndpoint.isEmpty()) {
+    if (requestId == null
+        || requestId.isEmpty()
+        || targetEndpoint == null
+        || targetEndpoint.isEmpty()) {
       return;
     }
     TARGETS.put(requestId, targetEndpoint);

@@ -2034,8 +2034,8 @@ public class SpannerOptions extends ServiceOptions<Spanner, SpannerOptions> {
 
     /**
      * Enables exporting Spanner built-in metrics to the {@link OpenTelemetry} configured with
-     * {@link #setOpenTelemetry(OpenTelemetry)}. When built-in metrics are also enabled, metrics
-     * are exported both to the default built-in Cloud Monitoring exporter and to the caller-owned
+     * {@link #setOpenTelemetry(OpenTelemetry)}. When built-in metrics are also enabled, metrics are
+     * exported both to the default built-in Cloud Monitoring exporter and to the caller-owned
      * {@link OpenTelemetry}. When built-in metrics are disabled, this option keeps built-in metric
      * recording enabled only for the caller-owned {@link OpenTelemetry}.
      */
@@ -2046,8 +2046,8 @@ public class SpannerOptions extends ServiceOptions<Spanner, SpannerOptions> {
     }
 
     /**
-     * Sets the {@code client_name} label used when exporting built-in metrics to a
-     * caller-provided OpenTelemetry instance.
+     * Sets the {@code client_name} label used when exporting built-in metrics to a caller-provided
+     * OpenTelemetry instance.
      *
      * <p>This does not affect Spanner's internal built-in Cloud Monitoring exporter.
      */
@@ -2567,8 +2567,7 @@ public class SpannerOptions extends ServiceOptions<Spanner, SpannerOptions> {
       if (builtInOpenTelemetry != null) {
         tracerFactories.add(
             new BuiltInMetricsTracerFactory(
-                new BuiltInMetricsRecorder(
-                    builtInOpenTelemetry, BuiltInMetricsConstant.METER_NAME),
+                new BuiltInMetricsRecorder(builtInOpenTelemetry, BuiltInMetricsConstant.METER_NAME),
                 new HashMap<>(),
                 new TraceWrapper(
                     Tracing.getTracer(),
@@ -2581,7 +2580,8 @@ public class SpannerOptions extends ServiceOptions<Spanner, SpannerOptions> {
       }
     }
     if (exportBuiltInMetricsToOpenTelemetry) {
-      Map<String, String> customExporterAttributes = this.builtInMetricsProvider.createClientAttributes();
+      Map<String, String> customExporterAttributes =
+          this.builtInMetricsProvider.createClientAttributes();
       if (!Strings.isNullOrEmpty(builtInMetricsClientName)) {
         customExporterAttributes.put(
             BuiltInMetricsConstant.CLIENT_NAME_KEY.getKey(), builtInMetricsClientName);

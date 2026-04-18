@@ -107,7 +107,6 @@ class HeaderInterceptor implements ClientInterceptor {
           DatabaseName databaseName = extractDatabaseName(headers);
           String key = extractKey(databaseName, method.getFullMethodName());
           String requestId = extractRequestId(headers);
-          String targetEndpoint = RequestIdTargetTracker.get(requestId);
           TagContext tagContext = getTagContext(key, method.getFullMethodName(), databaseName);
           Attributes attributes =
               getMetricAttributes(key, method.getFullMethodName(), databaseName);
@@ -117,10 +116,6 @@ class HeaderInterceptor implements ClientInterceptor {
             if (requestId != null) {
               earlyBuiltInMetricsAttributes.put(
                   BuiltInMetricsConstant.REQUEST_ID_KEY.getKey(), requestId);
-            }
-            if (targetEndpoint != null) {
-              earlyBuiltInMetricsAttributes.put(
-                  BuiltInMetricsConstant.TARGET_ENDPOINT_KEY.getKey(), targetEndpoint);
             }
             compositeTracer.addAttributes(earlyBuiltInMetricsAttributes);
           }
@@ -157,11 +152,12 @@ class HeaderInterceptor implements ClientInterceptor {
                     LOGGER.log(
                         LEVEL, "Unable to get built-in metric attributes {}", e.getMessage());
                   }
+                  String resolvedTargetEndpoint = RequestIdTargetTracker.get(requestId);
                   recordBuiltInMetrics(
                       compositeTracer,
                       builtInMetricsAttributes,
                       requestId,
-                      targetEndpoint,
+                      resolvedTargetEndpoint,
                       isDirectPathUsed,
                       isAfeEnabled);
                   RequestIdTargetTracker.remove(requestId);

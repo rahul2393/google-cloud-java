@@ -64,7 +64,8 @@ class GrpcStreamIterator extends AbstractIterator<PartialResultSet>
   @VisibleForTesting
   GrpcStreamIterator(
       boolean lastStatement, int prefetchChunks, boolean cancelQueryWhenClientIsClosed) {
-    this(null, lastStatement, prefetchChunks, cancelQueryWhenClientIsClosed, null, System::nanoTime);
+    this(
+        null, lastStatement, prefetchChunks, cancelQueryWhenClientIsClosed, null, System::nanoTime);
   }
 
   @VisibleForTesting

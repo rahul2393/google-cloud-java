@@ -16,10 +16,14 @@
 
 package com.google.cloud.spanner.spi.v1;
 
+import static com.google.api.gax.grpc.GrpcCallContext.TRACER_KEY;
 import static com.google.cloud.spanner.XGoogSpannerRequestId.REQUEST_ID_CALL_OPTIONS_KEY;
 
 import com.google.api.core.InternalApi;
 import com.google.api.gax.grpc.InstantiatingGrpcChannelProvider;
+import com.google.api.gax.tracing.ApiTracer;
+import com.google.cloud.spanner.BuiltInMetricsConstant;
+import com.google.cloud.spanner.CompositeTracer;
 import com.google.cloud.spanner.XGoogSpannerRequestId;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.cache.Cache;
@@ -143,7 +147,7 @@ final class KeyAwareChannel extends ManagedChannel {
     this.lifecycleManager =
         (endpointCacheFactory == null) ? new EndpointLifecycleManager(endpointCache) : null;
     this.endpointOverloadCooldowns = endpointOverloadCooldowns;
-    this.endpointStateProvider = this::snapshotEndpointStateCounts;
+    this.endpointStateProvider = this::snapshotEndpointStates;
     LocationAwareTelemetry.registerEndpointStateProvider(endpointStateProvider);
   }
 
@@ -523,16 +527,23 @@ final class KeyAwareChannel extends ManagedChannel {
     return nanos / 1_000_000d;
   }
 
-  private Map<String, Long> snapshotEndpointStateCounts() {
-    Map<String, Long> counts = new HashMap<>();
+  private Map<String, Set<String>> snapshotEndpointStates() {
+    Map<String, Set<String>> states = new HashMap<>();
     if (lifecycleManager != null) {
-      counts.putAll(lifecycleManager.snapshotEndpointStateCounts());
+      lifecycleManager
+          .snapshotEndpointStates()
+          .forEach(
+              (address, state) -> {
+                if (address == null || address.isEmpty() || state == null || state.isEmpty()) {
+                  return;
+                }
+                states.computeIfAbsent(address, ignored -> new HashSet<>()).add(state);
+              });
     }
-    int cooldownCount = endpointOverloadCooldowns.activeCooldownCount();
-    if (cooldownCount > 0) {
-      counts.merge("cooldown", (long) cooldownCount, Long::sum);
+    for (String address : endpointOverloadCooldowns.snapshotCoolingDownAddresses()) {
+      states.computeIfAbsent(address, ignored -> new HashSet<>()).add("cooldown");
     }
-    return counts;
+    return states;
   }
 
   static final class KeyAwareClientCall<RequestT, ResponseT>
@@ -697,6 +708,12 @@ final class KeyAwareChannel extends ManagedChannel {
         XGoogSpannerRequestId requestId = callOptions.getOption(REQUEST_ID_CALL_OPTIONS_KEY);
         if (requestId != null) {
           RequestIdTargetTracker.record(requestId.getHeaderValue(), endpoint.getAddress());
+        }
+        ApiTracer tracer = callOptions.getOption(TRACER_KEY);
+        if (tracer instanceof CompositeTracer) {
+          ((CompositeTracer) tracer)
+              .addAttributes(
+                  BuiltInMetricsConstant.TARGET_ENDPOINT_KEY.getKey(), endpoint.getAddress());
         }
         long routeSelectionCompletedAtNanos = System.nanoTime();
         recordRouteSelectionTrace(
@@ -977,7 +994,9 @@ final class KeyAwareChannel extends ManagedChannel {
 
         @Override
         public void createPendingStream() {
-          addEvent("spanner.stream.pending", baseAttributes(System.nanoTime() - streamCreationStartedAtNanos));
+          addEvent(
+              "spanner.stream.pending",
+              baseAttributes(System.nanoTime() - streamCreationStartedAtNanos));
         }
 
         @Override
@@ -1031,8 +1050,7 @@ final class KeyAwareChannel extends ManagedChannel {
                   .put("spanner.stream.hedging", hedging);
           if (nameResolutionDelayedNanos != null) {
             attributes.put(
-                "spanner.name_resolution_delay_ms",
-                nanosToMillis(nameResolutionDelayedNanos));
+                "spanner.name_resolution_delay_ms", nanosToMillis(nameResolutionDelayedNanos));
           }
           return attributes;
         }

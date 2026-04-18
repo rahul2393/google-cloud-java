@@ -724,15 +724,28 @@ public final class KeyRangeCache {
         Predicate<String> excludedEndpoints,
         Set<Long> skippedTabletUids,
         Map<String, ChannelEndpoint> resolvedEndpoints) {
-      if (tablet.skip
-          || tablet.serverAddress.isEmpty()
-          || excludedEndpoints.test(tablet.serverAddress)) {
+      if (tablet.skip) {
+        LocationAwareTelemetry.recordEndpointSkipped(
+            tablet.serverAddress, null, "tablet_marked_skip");
         addSkippedTablet(tablet, hintBuilder, skippedTabletUids);
+        return true;
+      }
+      if (tablet.serverAddress.isEmpty()) {
+        LocationAwareTelemetry.recordEndpointSkipped(null, null, "missing_address");
+        addSkippedTablet(tablet, hintBuilder, skippedTabletUids);
+        return true;
+      }
+      if (excludedEndpoints.test(tablet.serverAddress)) {
+        // Request-scoped exclusions are used for retry/cooldown decisions such as
+        // UNAVAILABLE/RESOURCE_EXHAUSTED and must not populate skipped_tablet_uid.
+        LocationAwareTelemetry.recordEndpointSkipped(tablet.serverAddress, null, "excluded");
         return true;
       }
 
       ChannelEndpoint endpoint = resolveEndpoint(tablet, resolvedEndpoints);
       if (endpoint == null) {
+        LocationAwareTelemetry.recordEndpointSkipped(
+            tablet.serverAddress, null, "missing_endpoint");
         logger.log(
             Level.FINE,
             "Tablet {0} at {1}: no endpoint present, skipping silently",
@@ -747,6 +760,8 @@ public final class KeyRangeCache {
         return false;
       }
       if (endpoint.isTransientFailure()) {
+        LocationAwareTelemetry.recordEndpointSkipped(
+            tablet.serverAddress, null, "transient_failure");
         logger.log(
             Level.FINE,
             "Tablet {0} at {1}: endpoint in TRANSIENT_FAILURE, adding to skipped_tablets",
@@ -755,6 +770,7 @@ public final class KeyRangeCache {
         return true;
       }
 
+      LocationAwareTelemetry.recordEndpointSkipped(tablet.serverAddress, null, "not_ready");
       logger.log(
           Level.FINE,
           "Tablet {0} at {1}: endpoint not ready, skipping silently",
@@ -777,6 +793,8 @@ public final class KeyRangeCache {
 
       ChannelEndpoint endpoint = resolveEndpoint(tablet, resolvedEndpoints);
       if (endpoint != null && endpoint.isTransientFailure()) {
+        LocationAwareTelemetry.recordEndpointSkipped(
+            tablet.serverAddress, null, "known_transient_failure");
         addSkippedTablet(tablet, hintBuilder, skippedTabletUids);
         return;
       }

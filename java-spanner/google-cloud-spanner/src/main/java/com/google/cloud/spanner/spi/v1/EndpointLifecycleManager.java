@@ -71,8 +71,9 @@ class EndpointLifecycleManager {
   private static final long EVICTION_CHECK_INTERVAL_SECONDS = 300;
 
   /**
-   * Maximum consecutive TRANSIENT_FAILURE probes before evicting an endpoint. Gives the channel
-   * time to recover from transient network issues before we tear it down and recreate.
+   * Maximum observed TRANSIENT_FAILURE probes before evicting an endpoint. The counter resets only
+   * after the channel reaches READY, so CONNECTING/IDLE oscillation does not hide a persistently
+   * unhealthy endpoint.
    */
   private static final int MAX_TRANSIENT_FAILURE_COUNT = 3;
 
@@ -489,14 +490,15 @@ class EndpointLifecycleManager {
    * sending a GetSession RPC. This is lighter weight and avoids routing application-level RPCs
    * through the endpoint's channel pool.
    *
-   * <p>If the channel is in TRANSIENT_FAILURE, increments a consecutive failure counter. After
-   * {@link #MAX_TRANSIENT_FAILURE_COUNT} consecutive failures, the endpoint is evicted and shut
-   * down so it can be recreated fresh when needed again.
+   * <p>If the channel is in TRANSIENT_FAILURE, increments a failure counter. After {@link
+   * #MAX_TRANSIENT_FAILURE_COUNT} TRANSIENT_FAILURE observations without an intervening READY
+   * state, the endpoint is evicted and shut down so it can be recreated fresh when needed again.
    *
    * <p>All exceptions are caught to prevent {@link ScheduledExecutorService} from cancelling future
    * runs of this task.
    */
-  private void probe(String address) {
+  @VisibleForTesting
+  void probe(String address) {
     try {
       if (isShutdown.get()) {
         return;
@@ -533,25 +535,24 @@ class EndpointLifecycleManager {
           logger.log(
               Level.FINE, "Probe for {0}: channel IDLE, requesting connection (warmup)", address);
           channel.getState(true);
-          state.consecutiveTransientFailures = 0;
           break;
 
         case CONNECTING:
-          state.consecutiveTransientFailures = 0;
           break;
 
         case TRANSIENT_FAILURE:
           state.consecutiveTransientFailures++;
           logger.log(
               Level.FINE,
-              "Probe for {0}: channel in TRANSIENT_FAILURE ({1}/{2})",
+              "Probe for {0}: channel in TRANSIENT_FAILURE ({1}/{2} observed failures since last"
+                  + " READY)",
               new Object[] {
                 address, state.consecutiveTransientFailures, MAX_TRANSIENT_FAILURE_COUNT
               });
           if (state.consecutiveTransientFailures >= MAX_TRANSIENT_FAILURE_COUNT) {
             logger.log(
                 Level.FINE,
-                "Evicting endpoint {0}: {1} consecutive TRANSIENT_FAILURE probes",
+                "Evicting endpoint {0}: {1} TRANSIENT_FAILURE probes without reaching READY",
                 new Object[] {address, state.consecutiveTransientFailures});
             evictEndpoint(address, EvictionReason.TRANSIENT_FAILURE);
           }
@@ -671,6 +672,12 @@ class EndpointLifecycleManager {
 
   Map<String, Long> snapshotEndpointStateCounts() {
     Map<String, Long> counts = new HashMap<>();
+    snapshotEndpointStates().values().forEach(state -> counts.merge(state, 1L, Long::sum));
+    return counts;
+  }
+
+  Map<String, String> snapshotEndpointStates() {
+    Map<String, String> states = new HashMap<>();
     for (String address : endpoints.keySet()) {
       ChannelEndpoint endpoint = endpointCache.getIfPresent(address);
       String stateName = "unknown";
@@ -681,12 +688,12 @@ class EndpointLifecycleManager {
                 ? "transient_failure"
                 : state.name().toLowerCase();
       }
-      counts.merge(stateName, 1L, Long::sum);
+      states.put(address, stateName);
     }
-    if (!evictedAddresses.isEmpty()) {
-      counts.put("evicted", (long) evictedAddresses.size());
+    for (String address : evictedAddresses) {
+      states.putIfAbsent(address, "evicted");
     }
-    return counts;
+    return states;
   }
 
   /** Shuts down the lifecycle manager and all probing. */

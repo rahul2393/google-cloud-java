@@ -130,7 +130,10 @@ class GrpcChannelEndpointCache implements ChannelEndpointCache {
     Builder builder = endpointProvider.toBuilder();
     // Location-aware endpoint channels connect directly to one replica IP. Keep these routed
     // channels fixed at one underlying connection and leave the default endpoint pool unchanged.
+    // Also keep transport keepalive active even when there are no application calls so endpoint
+    // readiness can be maintained between routed requests.
     builder.setChannelPoolSettings(ChannelPoolSettings.staticallySized(1));
+    builder.setKeepAliveWithoutCalls(Boolean.TRUE);
     final com.google.api.core.ApiFunction<ManagedChannelBuilder, ManagedChannelBuilder>
         baseConfigurator =
             endpointChannelConfigurator == null ? builder.getChannelConfigurator() : null;

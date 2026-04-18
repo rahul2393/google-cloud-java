@@ -78,23 +78,49 @@ public final class KeyRangeCache {
   static final class RouteLookupResult {
     @javax.annotation.Nullable final ChannelEndpoint endpoint;
     @javax.annotation.Nullable final String targetEndpointLabel;
+    final List<SkippedTabletDetail> skippedTabletDetails;
     final RouteFailureReason failureReason;
 
     private RouteLookupResult(
         @javax.annotation.Nullable ChannelEndpoint endpoint,
         @javax.annotation.Nullable String targetEndpointLabel,
+        List<SkippedTabletDetail> skippedTabletDetails,
         RouteFailureReason failureReason) {
       this.endpoint = endpoint;
       this.targetEndpointLabel = targetEndpointLabel;
+      this.skippedTabletDetails = skippedTabletDetails;
       this.failureReason = failureReason;
     }
 
-    static RouteLookupResult routed(ChannelEndpoint endpoint, String targetEndpointLabel) {
-      return new RouteLookupResult(endpoint, targetEndpointLabel, RouteFailureReason.NONE);
+    static RouteLookupResult routed(
+        ChannelEndpoint endpoint,
+        String targetEndpointLabel,
+        List<SkippedTabletDetail> skippedTabletDetails) {
+      return new RouteLookupResult(
+          endpoint,
+          targetEndpointLabel,
+          Collections.unmodifiableList(new ArrayList<>(skippedTabletDetails)),
+          RouteFailureReason.NONE);
     }
 
-    static RouteLookupResult failed(RouteFailureReason failureReason) {
-      return new RouteLookupResult(null, null, failureReason);
+    static RouteLookupResult failed(
+        RouteFailureReason failureReason, List<SkippedTabletDetail> skippedTabletDetails) {
+      return new RouteLookupResult(
+          null,
+          null,
+          Collections.unmodifiableList(new ArrayList<>(skippedTabletDetails)),
+          failureReason);
+    }
+  }
+
+  static final class SkippedTabletDetail {
+    @javax.annotation.Nullable final String targetEndpointLabel;
+    final String reason;
+
+    private SkippedTabletDetail(
+        @javax.annotation.Nullable String targetEndpointLabel, String reason) {
+      this.targetEndpointLabel = targetEndpointLabel;
+      this.reason = reason;
     }
   }
 
@@ -205,9 +231,10 @@ public final class KeyRangeCache {
       DirectedReadOptions directedReadOptions,
       RoutingHint.Builder hintBuilder,
       Predicate<String> excludedEndpoints) {
+    List<SkippedTabletDetail> skippedTabletDetails = new ArrayList<>();
     ByteString key = hintBuilder.getKey();
     if (key.isEmpty()) {
-      return RouteLookupResult.failed(RouteFailureReason.MISSING_ROUTING_KEY);
+      return RouteLookupResult.failed(RouteFailureReason.MISSING_ROUTING_KEY, skippedTabletDetails);
     }
 
     CachedRange targetRange;
@@ -219,7 +246,7 @@ public final class KeyRangeCache {
     }
 
     if (targetRange == null || targetRange.group == null) {
-      return RouteLookupResult.failed(RouteFailureReason.CACHE_MISS);
+      return RouteLookupResult.failed(RouteFailureReason.CACHE_MISS, skippedTabletDetails);
     }
 
     hintBuilder.setGroupUid(targetRange.group.groupUid);
@@ -228,7 +255,7 @@ public final class KeyRangeCache {
     hintBuilder.setLimitKey(targetRange.limitKey);
 
     return targetRange.group.lookupRoutingHint(
-        preferLeader, directedReadOptions, hintBuilder, excludedEndpoints);
+        preferLeader, directedReadOptions, hintBuilder, excludedEndpoints, skippedTabletDetails);
   }
 
   /** Returns all server addresses currently referenced by cached tablets. */
@@ -670,7 +697,8 @@ public final class KeyRangeCache {
         boolean preferLeader,
         DirectedReadOptions directedReadOptions,
         RoutingHint.Builder hintBuilder,
-        Predicate<String> excludedEndpoints) {
+        Predicate<String> excludedEndpoints,
+        List<SkippedTabletDetail> skippedTabletDetails) {
       GroupSnapshot snapshot = this.snapshot;
       Set<Long> skippedTabletUids = skippedTabletUids(hintBuilder);
       boolean hasDirectedReadOptions =
@@ -688,6 +716,7 @@ public final class KeyRangeCache {
               directedReadOptions,
               excludedEndpoints,
               skippedTabletUids,
+              skippedTabletDetails,
               resolvedEndpoints,
               selectionStats);
       if (selected == null) {
@@ -704,13 +733,16 @@ public final class KeyRangeCache {
                 hintBuilder,
                 excludedEndpoints,
                 skippedTabletUids,
+                skippedTabletDetails,
                 resolvedEndpoints);
             hintBuilder.setTabletUid(selected.tabletUid);
             return RouteLookupResult.routed(
-                resolveEndpoint(selected, resolvedEndpoints), endpointLabel(snapshot, selected));
+                resolveEndpoint(selected, resolvedEndpoints),
+                endpointLabel(snapshot, selected),
+                skippedTabletDetails);
           }
         }
-        return RouteLookupResult.failed(failureReason);
+        return RouteLookupResult.failed(failureReason, skippedTabletDetails);
       }
       recordKnownTransientFailures(
           snapshot,
@@ -719,10 +751,13 @@ public final class KeyRangeCache {
           hintBuilder,
           excludedEndpoints,
           skippedTabletUids,
+          skippedTabletDetails,
           resolvedEndpoints);
       hintBuilder.setTabletUid(selected.tabletUid);
       return RouteLookupResult.routed(
-          resolveEndpoint(selected, resolvedEndpoints), endpointLabel(snapshot, selected));
+          resolveEndpoint(selected, resolvedEndpoints),
+          endpointLabel(snapshot, selected),
+          skippedTabletDetails);
     }
 
     private TabletSnapshot selectTablet(
@@ -733,6 +768,7 @@ public final class KeyRangeCache {
         DirectedReadOptions directedReadOptions,
         Predicate<String> excludedEndpoints,
         Set<Long> skippedTabletUids,
+        List<SkippedTabletDetail> skippedTabletDetails,
         Map<String, ChannelEndpoint> resolvedEndpoints,
         SelectionStats selectionStats) {
       boolean checkedLeader = false;
@@ -748,6 +784,7 @@ public final class KeyRangeCache {
             hintBuilder,
             excludedEndpoints,
             skippedTabletUids,
+            skippedTabletDetails,
             resolvedEndpoints,
             selectionStats)) {
           return snapshot.leader();
@@ -768,6 +805,7 @@ public final class KeyRangeCache {
             hintBuilder,
             excludedEndpoints,
             skippedTabletUids,
+            skippedTabletDetails,
             resolvedEndpoints,
             selectionStats)) {
           continue;
@@ -815,13 +853,20 @@ public final class KeyRangeCache {
         RoutingHint.Builder hintBuilder,
         Predicate<String> excludedEndpoints,
         Set<Long> skippedTabletUids,
+        List<SkippedTabletDetail> skippedTabletDetails,
         Map<String, ChannelEndpoint> resolvedEndpoints) {
       for (TabletSnapshot tablet : snapshot.tablets) {
         if (tablet == selected || !tablet.matches(directedReadOptions)) {
           continue;
         }
         recordKnownTransientFailure(
-            snapshot, tablet, hintBuilder, excludedEndpoints, skippedTabletUids, resolvedEndpoints);
+            snapshot,
+            tablet,
+            hintBuilder,
+            excludedEndpoints,
+            skippedTabletUids,
+            skippedTabletDetails,
+            resolvedEndpoints);
       }
     }
 
@@ -839,6 +884,7 @@ public final class KeyRangeCache {
         RoutingHint.Builder hintBuilder,
         Predicate<String> excludedEndpoints,
         Set<Long> skippedTabletUids,
+        List<SkippedTabletDetail> skippedTabletDetails,
         Map<String, ChannelEndpoint> resolvedEndpoints,
         SelectionStats selectionStats) {
       String targetEndpointLabel = endpointLabel(snapshot, tablet);
@@ -846,13 +892,25 @@ public final class KeyRangeCache {
         selectionStats.tabletMarkedSkipCount++;
         LocationAwareTelemetry.recordEndpointSkipped(
             targetEndpointLabel, null, "tablet_marked_skip");
-        addSkippedTablet(tablet, hintBuilder, skippedTabletUids);
+        addSkippedTablet(
+            tablet,
+            hintBuilder,
+            skippedTabletUids,
+            skippedTabletDetails,
+            targetEndpointLabel,
+            "tablet_marked_skip");
         return true;
       }
       if (tablet.serverAddress.isEmpty()) {
         selectionStats.missingAddressCount++;
         LocationAwareTelemetry.recordEndpointSkipped(null, null, "missing_address");
-        addSkippedTablet(tablet, hintBuilder, skippedTabletUids);
+        addSkippedTablet(
+            tablet,
+            hintBuilder,
+            skippedTabletUids,
+            skippedTabletDetails,
+            null,
+            "missing_address");
         return true;
       }
       if (excludedEndpoints.test(tablet.serverAddress)) {
@@ -872,7 +930,8 @@ public final class KeyRangeCache {
             Level.FINE,
             "Tablet {0} at {1}: no endpoint present, skipping silently",
             new Object[] {tablet.tabletUid, tablet.serverAddress});
-        maybeAddRecentTransientFailureSkip(tablet, hintBuilder, skippedTabletUids);
+        maybeAddRecentTransientFailureSkip(
+            tablet, targetEndpointLabel, hintBuilder, skippedTabletUids, skippedTabletDetails);
         if (lifecycleManager != null) {
           lifecycleManager.requestEndpointRecreation(tablet.serverAddress);
         }
@@ -889,7 +948,13 @@ public final class KeyRangeCache {
             Level.FINE,
             "Tablet {0} at {1}: endpoint in TRANSIENT_FAILURE, adding to skipped_tablets",
             new Object[] {tablet.tabletUid, tablet.serverAddress});
-        addSkippedTablet(tablet, hintBuilder, skippedTabletUids);
+        addSkippedTablet(
+            tablet,
+            hintBuilder,
+            skippedTabletUids,
+            skippedTabletDetails,
+            targetEndpointLabel,
+            "transient_failure");
         return true;
       }
 
@@ -899,7 +964,8 @@ public final class KeyRangeCache {
           Level.FINE,
           "Tablet {0} at {1}: endpoint not ready, skipping silently",
           new Object[] {tablet.tabletUid, tablet.serverAddress});
-      maybeAddRecentTransientFailureSkip(tablet, hintBuilder, skippedTabletUids);
+      maybeAddRecentTransientFailureSkip(
+          tablet, targetEndpointLabel, hintBuilder, skippedTabletUids, skippedTabletDetails);
       return true;
     }
 
@@ -935,6 +1001,7 @@ public final class KeyRangeCache {
         RoutingHint.Builder hintBuilder,
         Predicate<String> excludedEndpoints,
         Set<Long> skippedTabletUids,
+        List<SkippedTabletDetail> skippedTabletDetails,
         Map<String, ChannelEndpoint> resolvedEndpoints) {
       if (tablet.skip
           || tablet.serverAddress.isEmpty()
@@ -946,11 +1013,22 @@ public final class KeyRangeCache {
       if (endpoint != null && endpoint.isTransientFailure()) {
         LocationAwareTelemetry.recordEndpointSkipped(
             endpointLabel(snapshot, tablet), null, "known_transient_failure");
-        addSkippedTablet(tablet, hintBuilder, skippedTabletUids);
+        addSkippedTablet(
+            tablet,
+            hintBuilder,
+            skippedTabletUids,
+            skippedTabletDetails,
+            endpointLabel(snapshot, tablet),
+            "known_transient_failure");
         return;
       }
 
-      maybeAddRecentTransientFailureSkip(tablet, hintBuilder, skippedTabletUids);
+      maybeAddRecentTransientFailureSkip(
+          tablet,
+          endpointLabel(snapshot, tablet),
+          hintBuilder,
+          skippedTabletUids,
+          skippedTabletDetails);
     }
 
     private String endpointLabel(GroupSnapshot snapshot, TabletSnapshot tablet) {
@@ -979,21 +1057,37 @@ public final class KeyRangeCache {
     }
 
     private void maybeAddRecentTransientFailureSkip(
-        TabletSnapshot tablet, RoutingHint.Builder hintBuilder, Set<Long> skippedTabletUids) {
+        TabletSnapshot tablet,
+        @javax.annotation.Nullable String targetEndpointLabel,
+        RoutingHint.Builder hintBuilder,
+        Set<Long> skippedTabletUids,
+        List<SkippedTabletDetail> skippedTabletDetails) {
       if (lifecycleManager != null
           && lifecycleManager.wasRecentlyEvictedTransientFailure(tablet.serverAddress)) {
-        addSkippedTablet(tablet, hintBuilder, skippedTabletUids);
+        addSkippedTablet(
+            tablet,
+            hintBuilder,
+            skippedTabletUids,
+            skippedTabletDetails,
+            targetEndpointLabel,
+            "recent_transient_failure_eviction");
       }
     }
 
     private void addSkippedTablet(
-        TabletSnapshot tablet, RoutingHint.Builder hintBuilder, Set<Long> skippedTabletUids) {
+        TabletSnapshot tablet,
+        RoutingHint.Builder hintBuilder,
+        Set<Long> skippedTabletUids,
+        List<SkippedTabletDetail> skippedTabletDetails,
+        @javax.annotation.Nullable String targetEndpointLabel,
+        String reason) {
       if (!skippedTabletUids.add(tablet.tabletUid)) {
         return;
       }
       RoutingHint.SkippedTablet.Builder skipped = hintBuilder.addSkippedTabletUidBuilder();
       skipped.setTabletUid(tablet.tabletUid);
       skipped.setIncarnation(tablet.incarnation);
+      skippedTabletDetails.add(new SkippedTabletDetail(targetEndpointLabel, reason));
     }
 
     String debugString() {

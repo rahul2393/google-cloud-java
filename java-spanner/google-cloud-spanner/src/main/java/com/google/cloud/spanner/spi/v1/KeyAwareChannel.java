@@ -54,8 +54,10 @@ import io.opentelemetry.api.trace.Span;
 import java.io.IOException;
 import java.lang.ref.ReferenceQueue;
 import java.lang.ref.SoftReference;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -649,6 +651,8 @@ final class KeyAwareChannel extends ManagedChannel {
         String routingDecisionLabel = "default_host";
         String routingReasonLabel = "unknown";
         String targetEndpointLabel = null;
+        List<KeyRangeCache.SkippedTabletDetail> routingSkippedTabletDetails =
+            Collections.emptyList();
 
         if (message instanceof ReadRequest) {
           ReadRequest.Builder reqBuilder = ((ReadRequest) message).toBuilder();
@@ -659,6 +663,7 @@ final class KeyAwareChannel extends ManagedChannel {
           routingDecisionLabel = routing.decision;
           routingReasonLabel = routing.reason;
           targetEndpointLabel = routing.targetEndpointLabel;
+          routingSkippedTabletDetails = routing.skippedTabletDetails;
           message = (RequestT) reqBuilder.build();
         } else if (message instanceof ExecuteSqlRequest) {
           ExecuteSqlRequest.Builder reqBuilder = ((ExecuteSqlRequest) message).toBuilder();
@@ -669,6 +674,7 @@ final class KeyAwareChannel extends ManagedChannel {
           routingDecisionLabel = routing.decision;
           routingReasonLabel = routing.reason;
           targetEndpointLabel = routing.targetEndpointLabel;
+          routingSkippedTabletDetails = routing.skippedTabletDetails;
           message = (RequestT) reqBuilder.build();
         } else if (message instanceof BeginTransactionRequest) {
           BeginTransactionRequest.Builder reqBuilder =
@@ -688,6 +694,7 @@ final class KeyAwareChannel extends ManagedChannel {
             } else {
               routingReasonLabel = routeFailureReasonLabel(routeLookup.failureReason);
             }
+            routingSkippedTabletDetails = routeLookup.skippedTabletDetails;
           } else if (databaseId == null) {
             routingReasonLabel = "missing_database_id";
           } else {
@@ -719,6 +726,7 @@ final class KeyAwareChannel extends ManagedChannel {
             } else {
               routingReasonLabel = routeFailureReasonLabel(routeLookup.failureReason);
             }
+            routingSkippedTabletDetails = routeLookup.skippedTabletDetails;
             request = reqBuilder.build();
           } else if (databaseId == null) {
             routingReasonLabel = "missing_database_id";
@@ -779,6 +787,16 @@ final class KeyAwareChannel extends ManagedChannel {
               "default_host",
               routingReasonLabel,
               targetEndpointLabel,
+              methodDescriptor.getFullMethodName());
+        }
+        for (KeyRangeCache.SkippedTabletDetail skippedTabletDetail : routingSkippedTabletDetails) {
+          LocationAwareTelemetry.recordRoutingSkippedTablet(
+              parentChannel.defaultEndpointAddress.equals(endpoint.getAddress())
+                  ? "default_host"
+                  : routingDecisionLabel,
+              targetEndpointLabel,
+              skippedTabletDetail.targetEndpointLabel,
+              skippedTabletDetail.reason,
               methodDescriptor.getFullMethodName());
         }
         selectedEndpoint = endpoint;
@@ -975,17 +993,24 @@ final class KeyAwareChannel extends ManagedChannel {
       String reason = "unknown";
       if (endpoint != null) {
         return new RoutingDecision(
-            null, endpoint, endpoint.getAddress(), "affinity", "selected");
+            null,
+            endpoint,
+            endpoint.getAddress(),
+            "affinity",
+            "selected",
+            Collections.emptyList());
       }
       if (databaseId == null) {
-        return new RoutingDecision(null, null, null, decision, "missing_database_id");
+        return new RoutingDecision(
+            null, null, null, decision, "missing_database_id", Collections.emptyList());
       }
       if (databaseId != null) {
         finder = parentChannel.getOrCreateChannelFinder(databaseId);
       }
+      KeyRangeCache.RouteLookupResult routed = null;
       if (endpoint == null) {
         Boolean preferLeaderOverride = parentChannel.readOnlyPreferLeader(transactionId);
-        KeyRangeCache.RouteLookupResult routed =
+        routed =
             preferLeaderOverride != null
                 ? finder.findServerResult(reqBuilder, preferLeaderOverride, excludedEndpoints)
                 : finder.findServerResult(reqBuilder, excludedEndpoints);
@@ -994,12 +1019,23 @@ final class KeyAwareChannel extends ManagedChannel {
           decision = "routed_replica";
           reason = "selected";
           return new RoutingDecision(
-              finder, endpoint, routed.targetEndpointLabel, decision, reason);
+              finder,
+              endpoint,
+              routed.targetEndpointLabel,
+              decision,
+              reason,
+              routed.skippedTabletDetails);
         } else {
           reason = routeFailureReasonLabel(routed.failureReason);
         }
       }
-      return new RoutingDecision(finder, endpoint, null, decision, reason);
+      return new RoutingDecision(
+          finder,
+          endpoint,
+          null,
+          decision,
+          reason,
+          routed == null ? Collections.emptyList() : routed.skippedTabletDetails);
     }
 
     private RoutingDecision routeFromRequest(ExecuteSqlRequest.Builder reqBuilder) {
@@ -1015,17 +1051,24 @@ final class KeyAwareChannel extends ManagedChannel {
       String reason = "unknown";
       if (endpoint != null) {
         return new RoutingDecision(
-            null, endpoint, endpoint.getAddress(), "affinity", "selected");
+            null,
+            endpoint,
+            endpoint.getAddress(),
+            "affinity",
+            "selected",
+            Collections.emptyList());
       }
       if (databaseId == null) {
-        return new RoutingDecision(null, null, null, decision, "missing_database_id");
+        return new RoutingDecision(
+            null, null, null, decision, "missing_database_id", Collections.emptyList());
       }
       if (databaseId != null) {
         finder = parentChannel.getOrCreateChannelFinder(databaseId);
       }
+      KeyRangeCache.RouteLookupResult routed = null;
       if (endpoint == null) {
         Boolean preferLeaderOverride = parentChannel.readOnlyPreferLeader(transactionId);
-        KeyRangeCache.RouteLookupResult routed =
+        routed =
             preferLeaderOverride != null
                 ? finder.findServerResult(reqBuilder, preferLeaderOverride, excludedEndpoints)
                 : finder.findServerResult(reqBuilder, excludedEndpoints);
@@ -1034,12 +1077,23 @@ final class KeyAwareChannel extends ManagedChannel {
           decision = "routed_replica";
           reason = "selected";
           return new RoutingDecision(
-              finder, endpoint, routed.targetEndpointLabel, decision, reason);
+              finder,
+              endpoint,
+              routed.targetEndpointLabel,
+              decision,
+              reason,
+              routed.skippedTabletDetails);
         } else {
           reason = routeFailureReasonLabel(routed.failureReason);
         }
       }
-      return new RoutingDecision(finder, endpoint, null, decision, reason);
+      return new RoutingDecision(
+          finder,
+          endpoint,
+          null,
+          decision,
+          reason,
+          routed == null ? Collections.emptyList() : routed.skippedTabletDetails);
     }
 
     private void enqueueCacheUpdate(com.google.spanner.v1.CacheUpdate cacheUpdate) {
@@ -1060,18 +1114,21 @@ final class KeyAwareChannel extends ManagedChannel {
     @Nullable private final String targetEndpointLabel;
     private final String decision;
     private final String reason;
+    private final List<KeyRangeCache.SkippedTabletDetail> skippedTabletDetails;
 
     private RoutingDecision(
         @Nullable ChannelFinder finder,
         @Nullable ChannelEndpoint endpoint,
         @Nullable String targetEndpointLabel,
         String decision,
-        String reason) {
+        String reason,
+        List<KeyRangeCache.SkippedTabletDetail> skippedTabletDetails) {
       this.finder = finder;
       this.endpoint = endpoint;
       this.targetEndpointLabel = targetEndpointLabel;
       this.decision = decision;
       this.reason = reason;
+      this.skippedTabletDetails = skippedTabletDetails;
     }
   }
 

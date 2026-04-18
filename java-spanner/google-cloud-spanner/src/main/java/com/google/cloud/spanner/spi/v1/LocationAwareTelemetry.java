@@ -39,6 +39,8 @@ final class LocationAwareTelemetry {
   private static final AttributeKey<String> METHOD_KEY = AttributeKey.stringKey("method");
   private static final AttributeKey<String> TARGET_ENDPOINT_KEY =
       AttributeKey.stringKey("target_endpoint");
+  private static final AttributeKey<String> SKIPPED_TARGET_ENDPOINT_KEY =
+      AttributeKey.stringKey("skipped_target_endpoint");
   private static final AttributeKey<String> REASON_KEY = AttributeKey.stringKey("reason");
   private static final AttributeKey<String> DECISION_KEY = AttributeKey.stringKey("decision");
   private static final Set<EndpointStateProvider> PROVIDERS = ConcurrentHashMap.newKeySet();
@@ -127,6 +129,27 @@ final class LocationAwareTelemetry {
     telemetry().routingDecisionCounter.add(1L, attributesBuilder.build());
   }
 
+  static void recordRoutingSkippedTablet(
+      String decision,
+      @Nullable String targetEndpoint,
+      @Nullable String skippedTargetEndpoint,
+      String reason,
+      @Nullable String method) {
+    io.opentelemetry.api.common.AttributesBuilder attributesBuilder = Attributes.builder();
+    attributesBuilder.put(DECISION_KEY, decision == null ? "unknown" : decision);
+    attributesBuilder.put(REASON_KEY, reason == null ? "unknown" : reason);
+    if (method != null && !method.isEmpty()) {
+      attributesBuilder.put(METHOD_KEY, method);
+    }
+    if (targetEndpoint != null && !targetEndpoint.isEmpty()) {
+      attributesBuilder.put(TARGET_ENDPOINT_KEY, targetEndpoint);
+    }
+    if (skippedTargetEndpoint != null && !skippedTargetEndpoint.isEmpty()) {
+      attributesBuilder.put(SKIPPED_TARGET_ENDPOINT_KEY, skippedTargetEndpoint);
+    }
+    telemetry().routingSkippedTabletCounter.add(1L, attributesBuilder.build());
+  }
+
   private static Attributes requestAttributes(
       @Nullable String targetEndpoint, @Nullable String method) {
     io.opentelemetry.api.common.AttributesBuilder attributesBuilder = Attributes.builder();
@@ -184,6 +207,7 @@ final class LocationAwareTelemetry {
     final LongCounter endpointEvictionCounter;
     final LongCounter endpointSkipCounter;
     final LongCounter routingDecisionCounter;
+    final LongCounter routingSkippedTabletCounter;
     final ObservableLongGauge endpointStateGauge;
     final ObservableLongGauge endpointStateCountGauge;
 
@@ -225,6 +249,12 @@ final class LocationAwareTelemetry {
           meter.counterBuilder("location_aware.routing_decision_count")
               .setDescription(
                   "Final location-aware routing decision, including default-host fallback reasons.")
+              .setUnit("1")
+              .build();
+      this.routingSkippedTabletCounter =
+          meter.counterBuilder("location_aware.routing_skipped_tablet_count")
+              .setDescription(
+                  "Skipped tablet reasons attached to a final location-aware routing decision.")
               .setUnit("1")
               .build();
       this.endpointStateGauge =

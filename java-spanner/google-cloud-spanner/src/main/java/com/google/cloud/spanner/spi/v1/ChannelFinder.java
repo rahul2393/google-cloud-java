@@ -31,6 +31,7 @@ import com.google.spanner.v1.TransactionOptions;
 import com.google.spanner.v1.TransactionSelector;
 import io.opentelemetry.api.trace.Span;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -379,7 +380,8 @@ public final class ChannelFinder {
   KeyRangeCache.RouteLookupResult findServerResult(
       BeginTransactionRequest.Builder reqBuilder, Predicate<String> excludedEndpoints) {
     if (!reqBuilder.hasMutationKey()) {
-      return KeyRangeCache.RouteLookupResult.failed(KeyRangeCache.RouteFailureReason.NONE);
+      return KeyRangeCache.RouteLookupResult.failed(
+          KeyRangeCache.RouteFailureReason.NONE, Collections.emptyList());
     }
     return routeMutationResult(
         reqBuilder.getMutationKey(),
@@ -407,7 +409,8 @@ public final class ChannelFinder {
       CommitRequest.Builder reqBuilder, Predicate<String> excludedEndpoints) {
     Mutation mutation = selectMutationForRouting(reqBuilder.getMutationsList());
     if (mutation == null) {
-      return KeyRangeCache.RouteLookupResult.failed(KeyRangeCache.RouteFailureReason.NONE);
+      return KeyRangeCache.RouteLookupResult.failed(
+          KeyRangeCache.RouteFailureReason.NONE, Collections.emptyList());
     }
     return routeMutationResult(
         mutation, /* preferLeader= */ true, reqBuilder.getRoutingHintBuilder(), excludedEndpoints);
@@ -445,7 +448,8 @@ public final class ChannelFinder {
     recipeCache.applySchemaGeneration(hintBuilder);
     TargetRange target = recipeCache.mutationToTargetRange(mutation);
     if (target == null) {
-      return KeyRangeCache.RouteLookupResult.failed(KeyRangeCache.RouteFailureReason.CACHE_MISS);
+      return KeyRangeCache.RouteLookupResult.failed(
+          KeyRangeCache.RouteFailureReason.CACHE_MISS, Collections.emptyList());
     }
     recipeCache.applyTargetRange(hintBuilder, target);
     return lookupRoutingHint(
@@ -464,7 +468,8 @@ public final class ChannelFinder {
       Predicate<String> excludedEndpoints) {
     long id = databaseId.get();
     if (id == 0) {
-      return KeyRangeCache.RouteLookupResult.failed(KeyRangeCache.RouteFailureReason.CACHE_MISS);
+      return KeyRangeCache.RouteLookupResult.failed(
+          KeyRangeCache.RouteFailureReason.CACHE_MISS, Collections.emptyList());
     }
     hintBuilder.setDatabaseId(id);
     return rangeCache.lookupRoutingHint(

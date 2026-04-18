@@ -329,6 +329,72 @@ public class LocationAwareSharedBackendReplicaHarnessTest {
   }
 
   @Test
+  public void routingSkippedTabletMetricsAreExportedToCustomerExporter() throws Exception {
+    InMemoryMetricReader metricReader = InMemoryMetricReader.create();
+    try (SharedBackendReplicaHarness harness = SharedBackendReplicaHarness.create(2);
+        Spanner spanner = createSpannerWithCustomExporter(harness, metricReader)) {
+      configureBackend(
+          harness, singleRowReadResultSet("b"), cacheUpdateWithSkippedLeaderReplica(harness));
+      DatabaseClient client = spanner.getDatabaseClient(DatabaseId.of(PROJECT, INSTANCE, DATABASE));
+
+      seedLocationMetadata(client);
+      waitForReplicaRoutedRead(client, harness, 1);
+      harness.clearRequests();
+
+      try (ResultSet routedRead =
+          client
+              .singleUse()
+              .read(
+                  TABLE,
+                  KeySet.singleKey(Key.of("b")),
+                  Arrays.asList("k"),
+                  Options.directedRead(DIRECTED_READ_OPTIONS))) {
+        assertTrue(routedRead.next());
+      }
+
+      ReadRequest routedReplicaRequest =
+          (ReadRequest)
+              harness
+                  .replicas
+                  .get(1)
+                  .getRequests(SharedBackendReplicaHarness.METHOD_STREAMING_READ)
+                  .get(0);
+      assertEquals(1, routedReplicaRequest.getRoutingHint().getSkippedTabletUidCount());
+      assertEquals(11L, routedReplicaRequest.getRoutingHint().getSkippedTabletUid(0).getTabletUid());
+
+      MetricData skippedTabletMetric =
+          getMetricData(metricReader, "location_aware.routing_skipped_tablet_count");
+      assertNotNull(skippedTabletMetric);
+      assertThat(skippedTabletMetric.getLongSumData().getPoints()).isNotEmpty();
+
+      AttributeKey<String> decisionKey = AttributeKey.stringKey("decision");
+      AttributeKey<String> reasonKey = AttributeKey.stringKey("reason");
+      AttributeKey<String> methodKey = AttributeKey.stringKey("method");
+      AttributeKey<String> endpointKey = AttributeKey.stringKey("target_endpoint");
+      AttributeKey<String> skippedEndpointKey = AttributeKey.stringKey("skipped_target_endpoint");
+
+      boolean foundSkippedTabletMetric =
+          skippedTabletMetric.getLongSumData().getPoints().stream()
+              .anyMatch(
+                  point ->
+                      point.getValue() > 0
+                          && "routed_replica".equals(point.getAttributes().get(decisionKey))
+                          && "tablet_marked_skip".equals(point.getAttributes().get(reasonKey))
+                          && STREAMING_READ_METHOD.equals(point.getAttributes().get(methodKey))
+                          && harness.replicaAddresses.get(1).equals(point.getAttributes().get(endpointKey))
+                          && harness
+                              .replicaAddresses
+                              .get(0)
+                              .concat("-LEADER")
+                              .equals(point.getAttributes().get(skippedEndpointKey)));
+      assertTrue(
+          "Expected routed skipped-tablet metric point: "
+              + skippedTabletMetric.getLongSumData().getPoints(),
+          foundSkippedTabletMetric);
+    }
+  }
+
+  @Test
   public void singleUseReadCooldownSkipsReplicaOnNextRequestForBypassTraffic() throws Exception {
     try (SharedBackendReplicaHarness harness = SharedBackendReplicaHarness.create(2);
         Spanner spanner = createSpanner(harness)) {
@@ -820,6 +886,14 @@ public class LocationAwareSharedBackendReplicaHarnessTest {
   private static void configureBackend(
       SharedBackendReplicaHarness harness, com.google.spanner.v1.ResultSet readResultSet)
       throws TextFormat.ParseException {
+    configureBackend(harness, readResultSet, cacheUpdate(harness));
+  }
+
+  private static void configureBackend(
+      SharedBackendReplicaHarness harness,
+      com.google.spanner.v1.ResultSet readResultSet,
+      CacheUpdate cacheUpdate)
+      throws TextFormat.ParseException {
     Statement readStatement =
         StatementResult.createReadStatement(
             TABLE, KeySet.singleKey(Key.of("b")), Arrays.asList("k"));
@@ -828,7 +902,7 @@ public class LocationAwareSharedBackendReplicaHarnessTest {
         StatementResult.query(
             SEED_QUERY,
             singleRowReadResultSet("seed").toBuilder()
-                .setCacheUpdate(cacheUpdate(harness))
+                .setCacheUpdate(cacheUpdate)
                 .build()));
   }
 
@@ -899,6 +973,48 @@ public class LocationAwareSharedBackendReplicaHarnessTest {
                         .setLocation(REPLICA_LOCATION)
                         .setRole(Tablet.Role.READ_ONLY)
                         .setDistance(0))
+                .addTablets(
+                    Tablet.newBuilder()
+                        .setTabletUid(12L)
+                        .setServerAddress(harness.replicaAddresses.get(1))
+                        .setLocation(REPLICA_LOCATION)
+                        .setRole(Tablet.Role.READ_ONLY)
+                        .setDistance(0)))
+        .build();
+  }
+
+  private static CacheUpdate cacheUpdateWithSkippedLeaderReplica(SharedBackendReplicaHarness harness)
+      throws TextFormat.ParseException {
+    RecipeList recipes = readRecipeList();
+    RoutingHint routingHint = exactReadRoutingHint(recipes);
+    ByteString limitKey = routingHint.getLimitKey();
+    if (limitKey.isEmpty()) {
+      limitKey = routingHint.getKey().concat(ByteString.copyFrom(new byte[] {0}));
+    }
+
+    return CacheUpdate.newBuilder()
+        .setDatabaseId(12345L)
+        .setKeyRecipes(recipes)
+        .addRange(
+            Range.newBuilder()
+                .setStartKey(routingHint.getKey())
+                .setLimitKey(limitKey)
+                .setGroupUid(1L)
+                .setSplitId(1L)
+                .setGeneration(com.google.protobuf.ByteString.copyFromUtf8("gen-skip")))
+        .addGroup(
+            Group.newBuilder()
+                .setGroupUid(1L)
+                .setGeneration(com.google.protobuf.ByteString.copyFromUtf8("gen-skip"))
+                .setLeaderIndex(0)
+                .addTablets(
+                    Tablet.newBuilder()
+                        .setTabletUid(11L)
+                        .setServerAddress(harness.replicaAddresses.get(0))
+                        .setLocation(REPLICA_LOCATION)
+                        .setRole(Tablet.Role.READ_ONLY)
+                        .setDistance(0)
+                        .setSkip(true))
                 .addTablets(
                     Tablet.newBuilder()
                         .setTabletUid(12L)

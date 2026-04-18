@@ -25,17 +25,26 @@ import com.google.protobuf.Value;
 import com.google.spanner.v1.PartialResultSet;
 import com.google.spanner.v1.ResultSetMetadata;
 import com.google.spanner.v1.ResultSetStats;
+import java.util.HashMap;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 import javax.annotation.Nullable;
 
 @VisibleForTesting
 class GrpcResultSet extends AbstractResultSet<List<Object>>
     implements ProtobufResultSet, StreamingResultSet {
+  @VisibleForTesting static final long SLOW_ROW_MATERIALIZATION_EVENT_NANOS =
+      TimeUnit.MILLISECONDS.toNanos(1L);
+
   private final GrpcValueIterator iterator;
   private final Listener listener;
   private final DecodeMode decodeMode;
+  @Nullable private final ISpan traceSpan;
+  private final LongSupplier nanoClock;
   private ResultSetMetadata metadata;
   private GrpcStruct currRow;
   private List<Object> rowData;
@@ -44,14 +53,26 @@ class GrpcResultSet extends AbstractResultSet<List<Object>>
   private boolean closed;
 
   GrpcResultSet(CloseableIterator<PartialResultSet> iterator, Listener listener) {
-    this(iterator, listener, DecodeMode.DIRECT);
+    this(iterator, listener, DecodeMode.DIRECT, null, System::nanoTime);
   }
 
   GrpcResultSet(
       CloseableIterator<PartialResultSet> iterator, Listener listener, DecodeMode decodeMode) {
-    this.iterator = new GrpcValueIterator(iterator, listener);
+    this(iterator, listener, decodeMode, null, System::nanoTime);
+  }
+
+  @VisibleForTesting
+  GrpcResultSet(
+      CloseableIterator<PartialResultSet> iterator,
+      Listener listener,
+      DecodeMode decodeMode,
+      @Nullable ISpan traceSpan,
+      LongSupplier nanoClock) {
+    this.iterator = new GrpcValueIterator(iterator, listener, traceSpan, nanoClock);
     this.listener = listener;
     this.decodeMode = decodeMode;
+    this.traceSpan = traceSpan;
+    this.nanoClock = nanoClock;
   }
 
   @Override
@@ -99,7 +120,9 @@ class GrpcResultSet extends AbstractResultSet<List<Object>>
         }
         currRow = new GrpcStruct(iterator.type(), rowData, decodeMode);
       }
+      long rowMaterializationStartedAtNanos = nanoClock.getAsLong();
       boolean hasNext = currRow.consumeRow(iterator);
+      recordRowMaterialization(rowMaterializationStartedAtNanos, hasNext);
       if (!hasNext) {
         statistics = iterator.getStats();
         // Close the ResultSet when there is no more data.
@@ -155,5 +178,19 @@ class GrpcResultSet extends AbstractResultSet<List<Object>>
     SpannerException toThrow = listener.onError(e, beginTransaction, lastStatement);
     close();
     throw toThrow;
+  }
+
+  private void recordRowMaterialization(long startedAtNanos, boolean hasNext) {
+    if (traceSpan == null) {
+      return;
+    }
+    long elapsedNanos = nanoClock.getAsLong() - startedAtNanos;
+    if (elapsedNanos < SLOW_ROW_MATERIALIZATION_EVENT_NANOS) {
+      return;
+    }
+    Map<String, Object> attributes = new HashMap<>();
+    attributes.put("spanner.result_set.row_materialization_nanos", elapsedNanos);
+    attributes.put("spanner.result_set.has_next", hasNext ? "true" : "false");
+    traceSpan.addAnnotation("ResultSet row materialized", attributes);
   }
 }

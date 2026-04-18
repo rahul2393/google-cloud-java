@@ -959,7 +959,9 @@ abstract class AbstractReadContext
                     statement,
                     request.getLastStatement(),
                     prefetchChunks,
-                    cancelQueryWhenClientIsClosed);
+                    cancelQueryWhenClientIsClosed,
+                    span,
+                    System::nanoTime);
             if (streamListener != null) {
               stream.registerListener(streamListener);
             }
@@ -994,7 +996,11 @@ abstract class AbstractReadContext
           }
         };
     return new GrpcResultSet(
-        stream, this, options.hasDecodeMode() ? options.decodeMode() : defaultDecodeMode);
+        stream,
+        this,
+        options.hasDecodeMode() ? options.decodeMode() : defaultDecodeMode,
+        span,
+        System::nanoTime);
   }
 
   static Map<SpannerRpc.Option, ?> getChannelHintOptions(
@@ -1184,7 +1190,12 @@ abstract class AbstractReadContext
               XGoogSpannerRequestId requestId) {
             GrpcStreamIterator stream =
                 new GrpcStreamIterator(
-                    lastStatement, prefetchChunks, cancelQueryWhenClientIsClosed);
+                    null,
+                    lastStatement,
+                    prefetchChunks,
+                    cancelQueryWhenClientIsClosed,
+                    span,
+                    System::nanoTime);
             if (streamListener != null) {
               stream.registerListener(streamListener);
             }
@@ -1217,7 +1228,11 @@ abstract class AbstractReadContext
           }
         };
     return new GrpcResultSet(
-        stream, this, readOptions.hasDecodeMode() ? readOptions.decodeMode() : defaultDecodeMode);
+        stream,
+        this,
+        readOptions.hasDecodeMode() ? readOptions.decodeMode() : defaultDecodeMode,
+        span,
+        System::nanoTime);
   }
 
   private Struct consumeSingleRow(ResultSet resultSet) {

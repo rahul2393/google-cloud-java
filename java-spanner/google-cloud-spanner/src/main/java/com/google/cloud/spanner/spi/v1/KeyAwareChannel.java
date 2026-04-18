@@ -40,10 +40,12 @@ import io.grpc.ClientCall;
 import io.grpc.ClientStreamTracer;
 import io.grpc.ForwardingClientCall;
 import io.grpc.ForwardingClientCallListener.SimpleForwardingClientCallListener;
+import io.grpc.Grpc;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.common.AttributesBuilder;
 import io.opentelemetry.api.trace.Span;
 import java.io.IOException;
 import java.lang.ref.ReferenceQueue;
@@ -947,22 +949,99 @@ final class KeyAwareChannel extends ManagedChannel {
     public ClientStreamTracer newClientStreamTracer(
         ClientStreamTracer.StreamInfo info, Metadata headers) {
       long streamCreationStartedAtNanos = System.nanoTime();
+      int previousAttempts = info.getPreviousAttempts();
+      boolean transparentRetry = info.isTransparentRetry();
+      boolean hedging = info.isHedging();
+      Long nameResolutionDelayedNanos =
+          info.getCallOptions().getOption(ClientStreamTracer.NAME_RESOLUTION_DELAYED);
+      int outboundHeaderKeyCount = headers.keys().size();
       return new ClientStreamTracer() {
+        private boolean inboundHeadersRecorded;
+
         @Override
         public void streamCreated(io.grpc.Attributes transportAttrs, Metadata metadata) {
-          if (!span.getSpanContext().isValid()) {
+          AttributesBuilder attributes =
+              baseAttributes(System.nanoTime() - streamCreationStartedAtNanos);
+          if (transportAttrs.get(Grpc.TRANSPORT_ATTR_REMOTE_ADDR) != null) {
+            attributes.put(
+                "spanner.transport.remote_addr",
+                transportAttrs.get(Grpc.TRANSPORT_ATTR_REMOTE_ADDR).toString());
+          }
+          if (transportAttrs.get(Grpc.TRANSPORT_ATTR_LOCAL_ADDR) != null) {
+            attributes.put(
+                "spanner.transport.local_addr",
+                transportAttrs.get(Grpc.TRANSPORT_ATTR_LOCAL_ADDR).toString());
+          }
+          addEvent("spanner.stream.created", attributes);
+        }
+
+        @Override
+        public void createPendingStream() {
+          addEvent("spanner.stream.pending", baseAttributes(System.nanoTime() - streamCreationStartedAtNanos));
+        }
+
+        @Override
+        public void outboundHeaders() {
+          AttributesBuilder attributes =
+              baseAttributes(System.nanoTime() - streamCreationStartedAtNanos);
+          attributes.put("spanner.outbound_header_key_count", outboundHeaderKeyCount);
+          addEvent("spanner.stream.outbound_headers", attributes);
+        }
+
+        @Override
+        public void inboundHeaders() {
+          recordInboundHeaders(null);
+        }
+
+        @Override
+        public void inboundHeaders(Metadata headers) {
+          recordInboundHeaders(headers);
+        }
+
+        @Override
+        public void inboundTrailers(Metadata trailers) {
+          AttributesBuilder attributes =
+              baseAttributes(System.nanoTime() - streamCreationStartedAtNanos);
+          attributes.put("spanner.inbound_trailer_key_count", trailers.keys().size());
+          addEvent("spanner.stream.inbound_trailers", attributes);
+        }
+
+        private void recordInboundHeaders(@Nullable Metadata headers) {
+          if (inboundHeadersRecorded) {
             return;
           }
-          span.addEvent(
-              "spanner.stream.created",
+          inboundHeadersRecorded = true;
+          AttributesBuilder attributes =
+              baseAttributes(System.nanoTime() - streamCreationStartedAtNanos);
+          if (headers != null) {
+            attributes.put("spanner.inbound_header_key_count", headers.keys().size());
+          }
+          addEvent("spanner.stream.inbound_headers", attributes);
+        }
+
+        private AttributesBuilder baseAttributes(long elapsedNanos) {
+          AttributesBuilder attributes =
               Attributes.builder()
                   .put("spanner.route.method", method)
                   .put("spanner.target", targetEndpoint)
-                  .put(
-                      "spanner.stream.creation_ms",
-                      nanosToMillis(System.nanoTime() - streamCreationStartedAtNanos))
                   .put("spanner.route.selection_ms", routeSelectionMs)
-                  .build());
+                  .put("spanner.stream.elapsed_ms", nanosToMillis(elapsedNanos))
+                  .put("spanner.stream.previous_attempts", previousAttempts)
+                  .put("spanner.stream.transparent_retry", transparentRetry)
+                  .put("spanner.stream.hedging", hedging);
+          if (nameResolutionDelayedNanos != null) {
+            attributes.put(
+                "spanner.name_resolution_delay_ms",
+                nanosToMillis(nameResolutionDelayedNanos));
+          }
+          return attributes;
+        }
+
+        private void addEvent(String name, AttributesBuilder attributes) {
+          if (!span.getSpanContext().isValid()) {
+            return;
+          }
+          span.addEvent(name, attributes.build());
         }
       };
     }

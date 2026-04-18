@@ -21,6 +21,7 @@ import static com.google.common.base.Preconditions.checkState;
 
 import com.google.cloud.spanner.AbstractResultSet.CloseableIterator;
 import com.google.cloud.spanner.AbstractResultSet.Listener;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.AbstractIterator;
 import com.google.protobuf.ListValue;
 import com.google.protobuf.Value.KindCase;
@@ -29,17 +30,26 @@ import com.google.spanner.v1.ResultSetMetadata;
 import com.google.spanner.v1.ResultSetStats;
 import com.google.spanner.v1.TypeCode;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 import javax.annotation.Nullable;
 
 /** Adapts a stream of {@code PartialResultSet} messages into a stream of {@code Value} messages. */
 class GrpcValueIterator extends AbstractIterator<com.google.protobuf.Value> {
+  @VisibleForTesting static final long SLOW_PARTIAL_RESULT_SET_EVENT_NANOS =
+      TimeUnit.MILLISECONDS.toNanos(1L);
+
   private enum StreamValue {
     METADATA,
     RESULT,
   }
 
   private final CloseableIterator<PartialResultSet> stream;
+  @Nullable private final ISpan traceSpan;
+  private final LongSupplier nanoClock;
   private ResultSetMetadata metadata;
   private Type type;
   private PartialResultSet current;
@@ -48,8 +58,19 @@ class GrpcValueIterator extends AbstractIterator<com.google.protobuf.Value> {
   private final Listener listener;
 
   GrpcValueIterator(CloseableIterator<PartialResultSet> stream, Listener listener) {
+    this(stream, listener, null, System::nanoTime);
+  }
+
+  @VisibleForTesting
+  GrpcValueIterator(
+      CloseableIterator<PartialResultSet> stream,
+      Listener listener,
+      @Nullable ISpan traceSpan,
+      LongSupplier nanoClock) {
     this.stream = stream;
     this.listener = listener;
+    this.traceSpan = traceSpan;
+    this.nanoClock = nanoClock;
   }
 
   @SuppressWarnings("unchecked")
@@ -77,6 +98,8 @@ class GrpcValueIterator extends AbstractIterator<com.google.protobuf.Value> {
         kind == KindCase.STRING_VALUE
             ? value.getStringValue()
             : new ArrayList<>(value.getListValue().getValuesList());
+    long mergeStartedAtNanos = nanoClock.getAsLong();
+    long mergedChunkCount = 1L;
     while (current.getChunkedValue() && pos == current.getValuesCount()) {
       if (!ensureReady(StreamValue.RESULT)) {
         throw newSpannerException(
@@ -97,7 +120,9 @@ class GrpcValueIterator extends AbstractIterator<com.google.protobuf.Value> {
         concatLists(
             (List<com.google.protobuf.Value>) merged, newValue.getListValue().getValuesList());
       }
+      mergedChunkCount++;
     }
+    recordChunkMerge(kind, mergedChunkCount, nanoClock.getAsLong() - mergeStartedAtNanos);
     if (kind == KindCase.STRING_VALUE) {
       return com.google.protobuf.Value.newBuilder().setStringValue((String) merged).build();
     } else {
@@ -138,10 +163,12 @@ class GrpcValueIterator extends AbstractIterator<com.google.protobuf.Value> {
 
   private boolean ensureReady(StreamValue requiredValue) throws SpannerException {
     while (current == null || pos >= current.getValuesCount()) {
+      long partialResultFetchStartedAtNanos = nanoClock.getAsLong();
       if (!stream.hasNext()) {
         return false;
       }
       current = stream.next();
+      recordPartialResultFetch(partialResultFetchStartedAtNanos, requiredValue, current);
       pos = 0;
       if (type == null) {
         // This is the first message on the stream.
@@ -173,6 +200,38 @@ class GrpcValueIterator extends AbstractIterator<com.google.protobuf.Value> {
       }
     }
     return true;
+  }
+
+  private void recordPartialResultFetch(
+      long startedAtNanos, StreamValue requiredValue, PartialResultSet partialResultSet) {
+    if (traceSpan == null) {
+      return;
+    }
+    long elapsedNanos = nanoClock.getAsLong() - startedAtNanos;
+    if (elapsedNanos < SLOW_PARTIAL_RESULT_SET_EVENT_NANOS) {
+      return;
+    }
+    Map<String, Object> attributes = new HashMap<>();
+    attributes.put("spanner.partial_result_set.fetch_nanos", elapsedNanos);
+    attributes.put(
+        "spanner.partial_result_set.value_count", (long) partialResultSet.getValuesCount());
+    attributes.put(
+        "spanner.partial_result_set.has_resume_token",
+        partialResultSet.getResumeToken().isEmpty() ? "false" : "true");
+    attributes.put("spanner.partial_result_set.required_value", requiredValue.name());
+    traceSpan.addAnnotation("PartialResultSet fetched from stream", attributes);
+  }
+
+  private void recordChunkMerge(KindCase kind, long mergedChunkCount, long elapsedNanos) {
+    if (traceSpan == null
+        || (mergedChunkCount <= 1L && elapsedNanos < SLOW_PARTIAL_RESULT_SET_EVENT_NANOS)) {
+      return;
+    }
+    Map<String, Object> attributes = new HashMap<>();
+    attributes.put("spanner.chunk_merge.nanos", elapsedNanos);
+    attributes.put("spanner.chunk_merge.parts", mergedChunkCount);
+    attributes.put("spanner.chunk_merge.kind", kind.name());
+    traceSpan.addAnnotation("Chunked PartialResultSet merged", attributes);
   }
 
   void close(@Nullable String message) {

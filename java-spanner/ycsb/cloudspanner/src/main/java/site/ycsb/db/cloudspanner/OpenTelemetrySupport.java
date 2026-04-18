@@ -23,6 +23,7 @@ import com.google.cloud.opentelemetry.trace.TraceExporter;
 import com.google.cloud.spanner.SpannerOptions;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.common.AttributesBuilder;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.api.trace.Tracer;
@@ -61,6 +62,11 @@ final class OpenTelemetrySupport {
   private static final String PROP_CLIENT_NAME = "cloudspanner.otel.client.name";
   private static final String ENV_CLIENT_NAME = "YCSB_OTEL_CLIENT_NAME";
   private static final String ENV_HOSTNAME = "HOSTNAME";
+  private static final String PROP_SERVICE_INSTANCE_ID = "cloudspanner.otel.service.instance.id";
+  private static final String ENV_SERVICE_INSTANCE_ID = "OTEL_SERVICE_INSTANCE_ID";
+  private static final String ENV_POD_NAME = "POD_NAME";
+  private static final String ENV_POD_NAMESPACE = "POD_NAMESPACE";
+  private static final String ENV_NODE_NAME = "NODE_NAME";
   private static final String PROP_METRIC_EXPORT_INTERVAL_SECONDS =
       "cloudspanner.otel.metric.export.interval.seconds";
   private static final String ENV_METRIC_EXPORT_INTERVAL_SECONDS =
@@ -227,12 +233,7 @@ final class OpenTelemetrySupport {
             ENV_EXPORT_BUILTIN_METRICS,
             metricsEnabled);
 
-    Resource resource =
-        Resource.getDefault()
-            .merge(
-                Resource.create(
-                    Attributes.of(
-                        AttributeKey.stringKey("service.name"), configuredServiceName)));
+    Resource resource = createResource(properties, configuredServiceName, configuredClientName);
 
     OpenTelemetrySdkBuilder sdkBuilder = OpenTelemetrySdk.builder();
 
@@ -318,8 +319,7 @@ final class OpenTelemetrySupport {
   }
 
   private static String resolveClientName(Properties properties, String serviceName) {
-    String configured =
-        getString(properties, PROP_CLIENT_NAME, ENV_CLIENT_NAME, "");
+    String configured = getString(properties, PROP_CLIENT_NAME, ENV_CLIENT_NAME, "");
     if (!configured.isEmpty()) {
       return configured;
     }
@@ -328,6 +328,46 @@ final class OpenTelemetrySupport {
       return serviceName + "/" + hostname;
     }
     return serviceName;
+  }
+
+  private static Resource createResource(
+      Properties properties, String serviceName, String clientName) {
+    AttributesBuilder attributes = Attributes.builder();
+    attributes.put(AttributeKey.stringKey("service.name"), serviceName);
+
+    String podName = firstNonEmpty(System.getenv(ENV_POD_NAME), System.getenv(ENV_HOSTNAME));
+    String podNamespace = System.getenv(ENV_POD_NAMESPACE);
+    String nodeName = System.getenv(ENV_NODE_NAME);
+    String serviceInstanceId =
+        firstNonEmpty(
+            getString(properties, PROP_SERVICE_INSTANCE_ID, ENV_SERVICE_INSTANCE_ID, ""),
+            podName,
+            clientName);
+
+    putIfPresent(attributes, "service.instance.id", serviceInstanceId);
+    putIfPresent(attributes, "service.namespace", podNamespace);
+    putIfPresent(attributes, "host.name", podName);
+    putIfPresent(attributes, "host.id", serviceInstanceId);
+    putIfPresent(attributes, "k8s.pod.name", podName);
+    putIfPresent(attributes, "k8s.namespace.name", podNamespace);
+    putIfPresent(attributes, "k8s.node.name", nodeName);
+
+    return Resource.getDefault().merge(Resource.create(attributes.build()));
+  }
+
+  private static void putIfPresent(AttributesBuilder attributes, String key, String value) {
+    if (value != null && !value.isEmpty()) {
+      attributes.put(AttributeKey.stringKey(key), value);
+    }
+  }
+
+  private static String firstNonEmpty(String... values) {
+    for (String value : values) {
+      if (value != null && !value.isEmpty()) {
+        return value;
+      }
+    }
+    return "";
   }
 
   private static double nanosToMillis(long nanos) {

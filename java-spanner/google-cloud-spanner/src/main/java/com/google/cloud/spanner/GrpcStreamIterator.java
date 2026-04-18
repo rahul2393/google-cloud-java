@@ -26,10 +26,13 @@ import com.google.common.collect.AbstractIterator;
 import com.google.common.util.concurrent.Uninterruptibles;
 import com.google.spanner.v1.PartialResultSet;
 import java.time.Duration;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
@@ -39,13 +42,16 @@ import javax.annotation.Nullable;
 class GrpcStreamIterator extends AbstractIterator<PartialResultSet>
     implements CloseableIterator<PartialResultSet> {
   private static final Logger logger = Logger.getLogger(GrpcStreamIterator.class.getName());
+  @VisibleForTesting static final long SLOW_QUEUE_EVENT_NANOS = TimeUnit.MILLISECONDS.toNanos(1L);
   static final PartialResultSet END_OF_STREAM = PartialResultSet.newBuilder().build();
   private final int prefetchChunks;
   private AsyncResultSet.StreamMessageListener streamMessageListener;
 
   private final ConsumerImpl consumer;
-  private final BlockingQueue<PartialResultSet> stream;
+  private final BlockingQueue<QueueEntry> stream;
   private final Statement statement;
+  @Nullable private final ISpan traceSpan;
+  private final LongSupplier nanoClock;
 
   private SpannerRpc.StreamingCall call;
   private volatile boolean withBeginTransaction;
@@ -58,7 +64,7 @@ class GrpcStreamIterator extends AbstractIterator<PartialResultSet>
   @VisibleForTesting
   GrpcStreamIterator(
       boolean lastStatement, int prefetchChunks, boolean cancelQueryWhenClientIsClosed) {
-    this(null, lastStatement, prefetchChunks, cancelQueryWhenClientIsClosed);
+    this(null, lastStatement, prefetchChunks, cancelQueryWhenClientIsClosed, null, System::nanoTime);
   }
 
   @VisibleForTesting
@@ -67,9 +73,28 @@ class GrpcStreamIterator extends AbstractIterator<PartialResultSet>
       boolean lastStatement,
       int prefetchChunks,
       boolean cancelQueryWhenClientIsClosed) {
+    this(
+        statement,
+        lastStatement,
+        prefetchChunks,
+        cancelQueryWhenClientIsClosed,
+        null,
+        System::nanoTime);
+  }
+
+  @VisibleForTesting
+  GrpcStreamIterator(
+      Statement statement,
+      boolean lastStatement,
+      int prefetchChunks,
+      boolean cancelQueryWhenClientIsClosed,
+      @Nullable ISpan traceSpan,
+      LongSupplier nanoClock) {
     this.statement = statement;
     this.lastStatement = lastStatement;
     this.prefetchChunks = prefetchChunks;
+    this.traceSpan = traceSpan;
+    this.nanoClock = nanoClock;
     this.consumer = new ConsumerImpl(cancelQueryWhenClientIsClosed);
     // One extra to allow for END_OF_STREAM message.
     this.stream = new LinkedBlockingQueue<>(prefetchChunks + 1);
@@ -131,7 +156,8 @@ class GrpcStreamIterator extends AbstractIterator<PartialResultSet>
 
   @Override
   protected final PartialResultSet computeNext() {
-    PartialResultSet next;
+    QueueEntry next;
+    long waitStartedAtNanos = nanoClock.getAsLong();
     try {
       if (streamWaitTimeoutUnit != null) {
         next = stream.poll(streamWaitTimeoutValue, streamWaitTimeoutUnit);
@@ -146,9 +172,10 @@ class GrpcStreamIterator extends AbstractIterator<PartialResultSet>
       // Treat interrupt as a request to cancel the read.
       throw SpannerExceptionFactory.propagateInterrupt(e);
     }
-    if (next != END_OF_STREAM) {
+    recordQueueDequeue(next, waitStartedAtNanos);
+    if (next.partialResultSet != END_OF_STREAM) {
       call.request(1);
-      return next;
+      return next.partialResultSet;
     }
 
     // All done - close() no longer needs to cancel the call.
@@ -163,9 +190,45 @@ class GrpcStreamIterator extends AbstractIterator<PartialResultSet>
   }
 
   private void addToStream(PartialResultSet results) {
+    long enqueueStartedAtNanos = nanoClock.getAsLong();
+    QueueEntry entry = QueueEntry.create(results, enqueueStartedAtNanos);
     // We assume that nothing from the user will interrupt gRPC event threads.
-    Uninterruptibles.putUninterruptibly(stream, results);
+    Uninterruptibles.putUninterruptibly(stream, entry);
+    entry.producerBlockedNanos = nanoClock.getAsLong() - enqueueStartedAtNanos;
+    entry.enqueuedAtNanos = nanoClock.getAsLong();
+    recordQueueEnqueue(entry);
     onStreamMessage(results);
+  }
+
+  private void recordQueueEnqueue(QueueEntry entry) {
+    if (traceSpan == null
+        || entry.partialResultSet == END_OF_STREAM
+        || entry.producerBlockedNanos < SLOW_QUEUE_EVENT_NANOS) {
+      return;
+    }
+    Map<String, Object> attributes = new HashMap<>();
+    attributes.put("spanner.queue.producer_block_nanos", entry.producerBlockedNanos);
+    attributes.put("spanner.queue.size", (long) stream.size());
+    traceSpan.addAnnotation("Stream queue producer blocked", attributes);
+  }
+
+  private void recordQueueDequeue(QueueEntry entry, long waitStartedAtNanos) {
+    if (traceSpan == null || entry.partialResultSet == END_OF_STREAM) {
+      return;
+    }
+    long dequeuedAtNanos = nanoClock.getAsLong();
+    long queueResidenceNanos = Math.max(0L, dequeuedAtNanos - entry.enqueuedAtNanos);
+    long consumerWaitNanos = Math.max(0L, dequeuedAtNanos - waitStartedAtNanos);
+    if (queueResidenceNanos < SLOW_QUEUE_EVENT_NANOS
+        && entry.producerBlockedNanos < SLOW_QUEUE_EVENT_NANOS) {
+      return;
+    }
+    Map<String, Object> attributes = new HashMap<>();
+    attributes.put("spanner.queue.residence_nanos", queueResidenceNanos);
+    attributes.put("spanner.queue.consumer_wait_nanos", consumerWaitNanos);
+    attributes.put("spanner.queue.size", (long) stream.size());
+    attributes.put("spanner.queue.producer_block_nanos", entry.producerBlockedNanos);
+    traceSpan.addAnnotation("Stream queue handed off PartialResultSet", attributes);
   }
 
   private class ConsumerImpl implements SpannerRpc.ResultStreamConsumer {
@@ -215,5 +278,20 @@ class GrpcStreamIterator extends AbstractIterator<PartialResultSet>
   private void onStreamMessage(PartialResultSet partialResultSet) {
     Optional.ofNullable(streamMessageListener)
         .ifPresent(sl -> sl.onStreamMessage(partialResultSet, stream.remainingCapacity() <= 1));
+  }
+
+  private static final class QueueEntry {
+    private final PartialResultSet partialResultSet;
+    private long enqueuedAtNanos;
+    private long producerBlockedNanos;
+
+    private QueueEntry(PartialResultSet partialResultSet, long enqueuedAtNanos) {
+      this.partialResultSet = partialResultSet;
+      this.enqueuedAtNanos = enqueuedAtNanos;
+    }
+
+    private static QueueEntry create(PartialResultSet partialResultSet, long enqueuedAtNanos) {
+      return new QueueEntry(partialResultSet, enqueuedAtNanos);
+    }
   }
 }

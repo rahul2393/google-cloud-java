@@ -51,10 +51,22 @@ import com.google.spanner.v1.TransactionOptions;
 import com.google.spanner.v1.TransactionSelector;
 import io.grpc.CallOptions;
 import io.grpc.ClientCall;
+import io.grpc.ClientStreamTracer;
+import io.grpc.Grpc;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.Status;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.context.Scope;
+import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.sdk.testing.exporter.InMemorySpanExporter;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.data.EventData;
+import io.opentelemetry.sdk.trace.data.SpanData;
+import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
+import java.net.InetSocketAddress;
 import java.io.IOException;
 import java.time.Clock;
 import java.time.Duration;
@@ -235,6 +247,107 @@ public class KeyAwareChannelTest {
     assertThat(harness.defaultManagedChannel.callCount()).isEqualTo(0);
     assertThat(listener.closeCount).isEqualTo(1);
     assertThat(listener.closedStatus.getCode()).isEqualTo(Status.Code.CANCELLED);
+  }
+
+  @Test
+  public void streamingCallAddsDetailedClientStreamTracerEvents() throws Exception {
+    InMemorySpanExporter spanExporter = InMemorySpanExporter.create();
+    SdkTracerProvider tracerProvider =
+        SdkTracerProvider.builder()
+            .addSpanProcessor(SimpleSpanProcessor.create(spanExporter))
+            .build();
+    OpenTelemetrySdk openTelemetry =
+        OpenTelemetrySdk.builder().setTracerProvider(tracerProvider).build();
+    TestHarness harness = createHarness();
+
+    try {
+      Span parentSpan = openTelemetry.getTracer("test").spanBuilder("parent").startSpan();
+      try (Scope ignored = parentSpan.makeCurrent()) {
+        ClientCall<ExecuteSqlRequest, PartialResultSet> call =
+            harness.channel.newCall(
+                SpannerGrpc.getExecuteStreamingSqlMethod(),
+                CallOptions.DEFAULT.withOption(ClientStreamTracer.NAME_RESOLUTION_DELAYED, 123L));
+
+        call.start(new CapturingListener<PartialResultSet>(), new Metadata());
+        call.sendMessage(ExecuteSqlRequest.newBuilder().setSession(SESSION).build());
+
+        @SuppressWarnings("unchecked")
+        RecordingClientCall<ExecuteSqlRequest, PartialResultSet> delegate =
+            (RecordingClientCall<ExecuteSqlRequest, PartialResultSet>)
+                harness.defaultManagedChannel.latestCall();
+        ClientStreamTracer.Factory tracerFactory =
+            delegate.callOptions.getStreamTracerFactories().get(0);
+        ClientStreamTracer tracer =
+            tracerFactory.newClientStreamTracer(
+                ClientStreamTracer.StreamInfo.newBuilder()
+                    .setCallOptions(
+                        CallOptions.DEFAULT.withOption(
+                            ClientStreamTracer.NAME_RESOLUTION_DELAYED, 123L))
+                    .setPreviousAttempts(1)
+                    .setIsTransparentRetry(true)
+                    .build(),
+                new Metadata());
+
+        tracer.createPendingStream();
+        tracer.streamCreated(
+            io.grpc.Attributes.newBuilder()
+                .set(Grpc.TRANSPORT_ATTR_REMOTE_ADDR, new InetSocketAddress("127.0.0.1", 443))
+                .set(Grpc.TRANSPORT_ATTR_LOCAL_ADDR, new InetSocketAddress("127.0.0.1", 12345))
+                .build(),
+            new Metadata());
+        tracer.outboundHeaders();
+        Metadata responseHeaders = new Metadata();
+        responseHeaders.put(Metadata.Key.of("server", Metadata.ASCII_STRING_MARSHALLER), "test");
+        tracer.inboundHeaders(responseHeaders);
+        Metadata trailers = new Metadata();
+        trailers.put(Metadata.Key.of("grpc-status-details-bin", Metadata.BINARY_BYTE_MARSHALLER),
+            new byte[] {1});
+        tracer.inboundTrailers(trailers);
+      } finally {
+        parentSpan.end();
+      }
+
+      List<SpanData> spans = spanExporter.getFinishedSpanItems();
+      assertThat(spans).hasSize(1);
+      List<String> eventNames = new ArrayList<>();
+      for (EventData event : spans.get(0).getEvents()) {
+        eventNames.add(event.getName());
+      }
+      assertThat(eventNames)
+          .containsAtLeast(
+              "spanner.stream.pending",
+              "spanner.stream.created",
+              "spanner.stream.outbound_headers",
+              "spanner.stream.inbound_headers",
+              "spanner.stream.inbound_trailers");
+
+      EventData createdEvent =
+          spans.get(0).getEvents().stream()
+              .filter(event -> event.getName().equals("spanner.stream.created"))
+              .findFirst()
+              .orElseThrow(AssertionError::new);
+      assertThat(createdEvent.getAttributes().get(AttributeKey.stringKey("spanner.target")))
+          .isEqualTo(DEFAULT_ADDRESS);
+      assertThat(
+              createdEvent
+                  .getAttributes()
+                  .get(AttributeKey.longKey("spanner.stream.previous_attempts")))
+          .isEqualTo(1L);
+      assertThat(
+              createdEvent
+                  .getAttributes()
+                  .get(AttributeKey.booleanKey("spanner.stream.transparent_retry")))
+          .isTrue();
+      assertThat(
+              createdEvent
+                  .getAttributes()
+                  .get(AttributeKey.doubleKey("spanner.name_resolution_delay_ms")))
+          .isGreaterThan(0.0d);
+    } finally {
+      harness.channel.shutdownNow();
+      openTelemetry.close();
+      tracerProvider.close();
+    }
   }
 
   @Test
@@ -1502,6 +1615,7 @@ public class KeyAwareChannelTest {
     public <RequestT, ResponseT> ClientCall<RequestT, ResponseT> newCall(
         MethodDescriptor<RequestT, ResponseT> methodDescriptor, CallOptions callOptions) {
       RecordingClientCall<RequestT, ResponseT> call = new RecordingClientCall<>();
+      call.callOptions = callOptions;
       calls.add(call);
       return call;
     }
@@ -1524,6 +1638,7 @@ public class KeyAwareChannelTest {
       extends ClientCall<RequestT, ResponseT> {
     @Nullable private ClientCall.Listener<ResponseT> listener;
     @Nullable private RequestT lastMessage;
+    @Nullable private CallOptions callOptions;
     private boolean cancelCalled;
     @Nullable private String cancelMessage;
     @Nullable private Throwable cancelCause;

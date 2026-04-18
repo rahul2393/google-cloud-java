@@ -22,6 +22,10 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.verify;
 
 import com.google.api.gax.grpc.GrpcCallContext;
 import com.google.api.gax.rpc.ApiCallContext;
@@ -54,6 +58,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 import javax.annotation.Nullable;
 import org.junit.Before;
 import org.junit.Test;
@@ -67,6 +73,8 @@ public class GrpcResultSetTest {
   private GrpcResultSet resultSet;
   private SpannerRpc.ResultStreamConsumer consumer;
   private GrpcStreamIterator stream;
+  private ISpan traceSpan;
+  private AtomicLong nanoClock;
   private final Duration streamWaitTimeout = Duration.ofNanos(1L);
 
   private static class NoOpListener implements AbstractResultSet.Listener {
@@ -89,9 +97,16 @@ public class GrpcResultSetTest {
 
   @Before
   public void setUp() {
+    traceSpan = org.mockito.Mockito.mock(ISpan.class);
+    nanoClock = new AtomicLong();
     stream =
         new GrpcStreamIterator(
-            /* lastStatement= */ false, 10, /* cancelQueryWhenClientIsClosed= */ false);
+            null,
+            /* lastStatement= */ false,
+            10,
+            /* cancelQueryWhenClientIsClosed= */ false,
+            traceSpan,
+            nanoClock::get);
     stream.setCall(
         new SpannerRpc.StreamingCall() {
           @Override
@@ -107,11 +122,78 @@ public class GrpcResultSetTest {
         },
         false);
     consumer = stream.consumer();
-    resultSet = new GrpcResultSet(stream, new NoOpListener());
+    resultSet =
+        new GrpcResultSet(stream, new NoOpListener(), DecodeMode.DIRECT, traceSpan, nanoClock::get);
   }
 
   public GrpcResultSet resultSetWithMode(QueryMode queryMode) {
-    return new GrpcResultSet(stream, new NoOpListener());
+    return new GrpcResultSet(
+        stream, new NoOpListener(), DecodeMode.DIRECT, traceSpan, nanoClock::get);
+  }
+
+  @Test
+  public void tracesSlowQueueResidenceAndRowMaterialization() {
+    ISpan localTraceSpan = org.mockito.Mockito.mock(ISpan.class);
+    LongSupplier sequenceNanoClock =
+        org.mockito.Mockito.mock(LongSupplier.class);
+    org.mockito.Mockito.when(sequenceNanoClock.getAsLong())
+        .thenReturn(
+            0L,
+            0L,
+            0L,
+            0L,
+            0L,
+            0L,
+            GrpcStreamIterator.SLOW_QUEUE_EVENT_NANOS + 10L,
+            GrpcStreamIterator.SLOW_QUEUE_EVENT_NANOS + 10L,
+            GrpcStreamIterator.SLOW_QUEUE_EVENT_NANOS + 20L,
+            GrpcStreamIterator.SLOW_QUEUE_EVENT_NANOS + 20L,
+            GrpcStreamIterator.SLOW_QUEUE_EVENT_NANOS + 30L,
+            GrpcStreamIterator.SLOW_QUEUE_EVENT_NANOS
+                + GrpcResultSet.SLOW_ROW_MATERIALIZATION_EVENT_NANOS
+                + 40L);
+    GrpcStreamIterator localStream =
+        new GrpcStreamIterator(
+            null,
+            /* lastStatement= */ false,
+            10,
+            /* cancelQueryWhenClientIsClosed= */ false,
+            localTraceSpan,
+            sequenceNanoClock);
+    localStream.setCall(
+        new SpannerRpc.StreamingCall() {
+          @Override
+          public ApiCallContext getCallContext() {
+            return GrpcCallContext.createDefault().withStreamWaitTimeoutDuration(streamWaitTimeout);
+          }
+
+          @Override
+          public void cancel(@Nullable String message) {}
+
+          @Override
+          public void request(int numMessages) {}
+        },
+        false);
+    SpannerRpc.ResultStreamConsumer localConsumer = localStream.consumer();
+    GrpcResultSet localResultSet =
+        new GrpcResultSet(
+            localStream, new NoOpListener(), DecodeMode.DIRECT, localTraceSpan, sequenceNanoClock);
+
+    PartialResultSet partialResultSet =
+        PartialResultSet.newBuilder()
+            .setMetadata(makeMetadata(Type.struct(Type.StructField.of("f", Type.string()))))
+            .addValues(Value.string("a").toProto())
+            .build();
+
+    localConsumer.onPartialResultSet(partialResultSet);
+    localConsumer.onCompleted();
+
+    assertThat(localResultSet.next()).isTrue();
+    assertThat(localResultSet.getString(0)).isEqualTo("a");
+
+    verify(localTraceSpan).addAnnotation(eq("Stream queue handed off PartialResultSet"), anyMap());
+    verify(localTraceSpan, atLeastOnce())
+        .addAnnotation(eq("ResultSet row materialized"), anyMap());
   }
 
   @Test

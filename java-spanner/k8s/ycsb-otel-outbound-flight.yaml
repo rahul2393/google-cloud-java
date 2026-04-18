@@ -2,23 +2,23 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   namespace: spanner-ns
-  name: ycsb-otel-outbound-flight
+  name: ycsb-java-zipfian
 spec:
-  parallelism: 1
-  completions: 1
+  completions: 5
+  parallelism: 5
+  completionMode: Indexed
   backoffLimit: 0
+  activeDeadlineSeconds: 18000
   ttlSecondsAfterFinished: 86400
   template:
     metadata:
       labels:
-        app: ycsb-otel-outbound-flight
+        app: ycsb-java-zipfian
     spec:
       restartPolicy: Never
-      nodeSelector:
-        iam.gke.io/gke-metadata-server-enabled: "true"
       containers:
         - name: ycsb-client
-          image: us-west1-docker.pkg.dev/outbound-flight/spanner-box/ycsb-client:latest
+          image: us-west1-docker.pkg.dev/outbound-flight/spanner-box/ycsb-client:with-metrics-support
           imagePullPolicy: Always
           args:
             - run
@@ -28,13 +28,25 @@ spec:
             - -P
             - cloudspanner/conf/cloudspanner.properties
             - -p
-            - recordcount=1000000000000
+            - recordcount=1000000000
             - -p
-            - operationcount=1000000000
+            - zeropadding=12
             - -p
-            - maxexecutiontime=18000
+            - insertorder=ordered
+            - -p
+            - operationcount=1000000000000
+            - -p
+            - maxexecutiontime=3600
+            - -p
+            - requestdistribution=zipfian
+            - -p
+            - requestpartition.count=1
+            - -p
+            - requestpartition.index=$(JOB_COMPLETION_INDEX)
+            - -p
+            - requestpartition.size=1000000000
             - -threads
-            - "50"
+            - "20"
             - -s
           resources:
             requests:
@@ -44,8 +56,10 @@ spec:
               cpu: "7"
               memory: "25Gi"
           env:
-            - name: GOOGLE_SPANNER_EXPERIMENTAL_LOCATION_API
-              value: "true"
+            - name: JOB_COMPLETION_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
             - name: OTEL_PROJECT_ID
               value: "outbound-flight"
             - name: OTEL_SERVICE_NAME
@@ -65,4 +79,4 @@ spec:
             - name: SPANNER_ENABLE_END_TO_END_TRACING
               value: "false"
             - name: JAVA_TOOL_OPTIONS
-              value: "-Xms16g -Xmx16g -XX:+AlwaysPreTouch -XX:+UseG1GC -Droot.level=ERROR -Djava.util.logging.config.file=/ycsb/cloudspanner/conf/logging-debug.properties"
+              value: "-Xms16g -Xmx16g -XX:+AlwaysPreTouch -XX:+UseG1GC"

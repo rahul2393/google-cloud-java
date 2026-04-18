@@ -30,8 +30,11 @@ import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.context.Scope;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import io.opentelemetry.sdk.OpenTelemetrySdkBuilder;
+import io.opentelemetry.sdk.common.CompletableResultCode;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
 import io.opentelemetry.sdk.metrics.SdkMeterProviderBuilder;
+import io.opentelemetry.sdk.metrics.data.AggregationTemporality;
+import io.opentelemetry.sdk.metrics.data.MetricData;
 import io.opentelemetry.sdk.metrics.export.MetricExporter;
 import io.opentelemetry.sdk.metrics.export.PeriodicMetricReader;
 import io.opentelemetry.sdk.resources.Resource;
@@ -40,8 +43,12 @@ import io.opentelemetry.sdk.trace.export.BatchSpanProcessor;
 import io.opentelemetry.sdk.trace.export.SpanExporter;
 import io.opentelemetry.sdk.trace.samplers.Sampler;
 import java.time.Duration;
+import java.util.Collection;
 import java.util.Properties;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Handler;
 import java.util.logging.Level;
+import java.util.logging.LogManager;
 import java.util.logging.Logger;
 import site.ycsb.Status;
 
@@ -71,10 +78,16 @@ final class OpenTelemetrySupport {
       "cloudspanner.otel.metric.export.interval.seconds";
   private static final String ENV_METRIC_EXPORT_INTERVAL_SECONDS =
       "OTEL_METRIC_EXPORT_INTERVAL_SECONDS";
+  private static final String PROP_METRIC_EXPORT_DEBUG = "cloudspanner.otel.metric.export.debug";
+  private static final String ENV_METRIC_EXPORT_DEBUG = "YCSB_OTEL_METRIC_EXPORT_DEBUG";
   private static final String PROP_EXPORT_BUILTIN_METRICS =
       "cloudspanner.metrics.export.builtin.to.otel";
   private static final String ENV_EXPORT_BUILTIN_METRICS =
       "YCSB_EXPORT_SPANNER_BUILTIN_METRICS_TO_OTEL";
+  private static final String PROP_CLOUD_MONITORING_DEBUG_LOGGING =
+      "cloudspanner.otel.cloud.monitoring.debug.logging";
+  private static final String ENV_CLOUD_MONITORING_DEBUG_LOGGING =
+      "YCSB_OTEL_CLOUD_MONITORING_DEBUG_LOGGING";
   private static final String PROP_TRACING_ENABLED = "cloudspanner.tracing.enabled";
   private static final String ENV_TRACING_ENABLED = "YCSB_ENABLE_OTEL_TRACING";
   private static final String PROP_USE_OTEL_FOR_SPANNER =
@@ -243,13 +256,18 @@ final class OpenTelemetrySupport {
             PROP_METRIC_EXPORT_INTERVAL_SECONDS,
             ENV_METRIC_EXPORT_INTERVAL_SECONDS,
             DEFAULT_EXPORT_INTERVAL_SECONDS);
+    maybeEnableCloudMonitoringDebugLogging(properties);
     MetricConfiguration metricConfiguration =
         MetricConfiguration.builder()
             .setProjectId(configuredProjectId)
             .setPrefix(configuredMetricPrefix)
             .build();
     MetricExporter metricExporter =
-        GoogleCloudMetricExporter.createWithConfiguration(metricConfiguration);
+        new DiagnosticMetricExporter(
+            GoogleCloudMetricExporter.createWithConfiguration(metricConfiguration),
+            configuredProjectId,
+            configuredMetricPrefix,
+            getBoolean(properties, PROP_METRIC_EXPORT_DEBUG, ENV_METRIC_EXPORT_DEBUG, true));
     SdkMeterProviderBuilder meterProviderBuilder =
         SdkMeterProvider.builder()
             .setResource(resource)
@@ -372,5 +390,153 @@ final class OpenTelemetrySupport {
 
   private static double nanosToMillis(long nanos) {
     return nanos / 1_000_000d;
+  }
+
+  private static void maybeEnableCloudMonitoringDebugLogging(Properties properties) {
+    if (!getBoolean(
+        properties,
+        PROP_CLOUD_MONITORING_DEBUG_LOGGING,
+        ENV_CLOUD_MONITORING_DEBUG_LOGGING,
+        false)) {
+      return;
+    }
+
+    LogManager logManager = LogManager.getLogManager();
+    Logger rootLogger = logManager.getLogger("");
+    if (rootLogger != null) {
+      rootLogger.setLevel(Level.FINEST);
+      for (Handler handler : rootLogger.getHandlers()) {
+        handler.setLevel(Level.FINEST);
+      }
+    }
+
+    setLoggerLevel(logManager, OpenTelemetrySupport.class.getName(), Level.FINE);
+    setLoggerLevel(logManager, "com.google.cloud.opentelemetry.metric", Level.FINEST);
+    setLoggerLevel(logManager, "com.google.cloud.monitoring.v3", Level.FINEST);
+    setLoggerLevel(logManager, "com.google.api.gax", Level.FINEST);
+    setLoggerLevel(logManager, "io.grpc", Level.FINE);
+
+    LOGGER.log(
+        Level.INFO,
+        "Enabled JUL debug logging for Cloud Monitoring export. SLF4J logs will route through JUL"
+            + " because slf4j-jdk14 is on the classpath.");
+  }
+
+  private static void setLoggerLevel(LogManager logManager, String loggerName, Level level) {
+    Logger logger = logManager.getLogger(loggerName);
+    if (logger == null) {
+      logger = Logger.getLogger(loggerName);
+    }
+    logger.setLevel(level);
+  }
+
+  private static final class DiagnosticMetricExporter implements MetricExporter {
+    private final MetricExporter delegate;
+    private final String projectId;
+    private final String metricPrefix;
+    private final boolean logSuccessfulExports;
+    private final AtomicLong exportAttempts = new AtomicLong();
+
+    private DiagnosticMetricExporter(
+        MetricExporter delegate,
+        String projectId,
+        String metricPrefix,
+        boolean logSuccessfulExports) {
+      this.delegate = delegate;
+      this.projectId = projectId;
+      this.metricPrefix = metricPrefix;
+      this.logSuccessfulExports = logSuccessfulExports;
+    }
+
+    @Override
+    public CompletableResultCode export(Collection<MetricData> metrics) {
+      long exportNumber = exportAttempts.incrementAndGet();
+      MetricExportSummary summary = MetricExportSummary.create(metrics);
+
+      if (logSuccessfulExports) {
+        LOGGER.log(
+            Level.INFO,
+            "OTEL metric export attempt #{0}: metricCount={1}, pointCount={2}, prefix={3},"
+                + " project={4}, metrics={5}",
+            new Object[] {
+                exportNumber,
+                summary.metricCount,
+                summary.pointCount,
+                metricPrefix,
+                projectId,
+                summary.metricNames
+            });
+      }
+
+      CompletableResultCode result = delegate.export(metrics);
+      Runnable completionLogger =
+          new Runnable() {
+            @Override
+            public void run() {
+              Level level = result.isSuccess() ? Level.INFO : Level.WARNING;
+              if (result.isSuccess() && !logSuccessfulExports) {
+                return;
+              }
+              LOGGER.log(
+                  level,
+                  "OTEL metric export attempt #{0} completed: success={1}, metricCount={2},"
+                      + " pointCount={3}, prefix={4}, project={5}",
+                  new Object[] {
+                      exportNumber,
+                      result.isSuccess(),
+                      summary.metricCount,
+                      summary.pointCount,
+                      metricPrefix,
+                      projectId
+                  });
+            }
+          };
+      result.whenComplete(completionLogger);
+      return result;
+    }
+
+    @Override
+    public CompletableResultCode flush() {
+      return delegate.flush();
+    }
+
+    @Override
+    public CompletableResultCode shutdown() {
+      return delegate.shutdown();
+    }
+
+    @Override
+    public AggregationTemporality getAggregationTemporality(
+        io.opentelemetry.sdk.metrics.InstrumentType instrumentType) {
+      return delegate.getAggregationTemporality(instrumentType);
+    }
+  }
+
+  private static final class MetricExportSummary {
+    private final int metricCount;
+    private final long pointCount;
+    private final String metricNames;
+
+    private MetricExportSummary(int metricCount, long pointCount, String metricNames) {
+      this.metricCount = metricCount;
+      this.pointCount = pointCount;
+      this.metricNames = metricNames;
+    }
+
+    private static MetricExportSummary create(Collection<MetricData> metrics) {
+      StringBuilder names = new StringBuilder();
+      long points = 0L;
+      int metricCount = 0;
+      for (MetricData metric : metrics) {
+        if (metricCount > 0) {
+          names.append(", ");
+        }
+        long metricPoints = metric.getData().getPoints().size();
+        names.append(metric.getName()).append("[").append(metricPoints).append("]");
+        points += metricPoints;
+        metricCount++;
+      }
+      return new MetricExportSummary(metricCount, points, names.toString());
+    }
   }
 }

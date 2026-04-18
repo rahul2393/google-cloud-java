@@ -34,6 +34,7 @@ import com.google.spanner.v1.RollbackRequest;
 import com.google.spanner.v1.Session;
 import com.google.spanner.v1.SpannerGrpc;
 import com.google.spanner.v1.Transaction;
+import io.grpc.Grpc;
 import io.grpc.Metadata;
 import io.grpc.Server;
 import io.grpc.ServerCall;
@@ -45,6 +46,7 @@ import io.grpc.stub.StreamObserver;
 import java.io.Closeable;
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -71,6 +73,7 @@ final class SharedBackendReplicaHarness implements Closeable {
     private final Map<String, ArrayDeque<Throwable>> methodErrors = new HashMap<>();
     private final Map<String, List<AbstractMessage>> requests = new HashMap<>();
     private final Map<String, List<String>> requestIds = new HashMap<>();
+    private final Map<String, List<String>> peerAddresses = new HashMap<>();
 
     private HookedReplicaSpannerService(MockSpannerServiceImpl backend) {
       this.backend = backend;
@@ -92,9 +95,14 @@ final class SharedBackendReplicaHarness implements Closeable {
       return new ArrayList<>(requestIds.getOrDefault(method, new ArrayList<>()));
     }
 
+    synchronized List<String> getPeerAddresses(String method) {
+      return new ArrayList<>(peerAddresses.getOrDefault(method, new ArrayList<>()));
+    }
+
     synchronized void clearRequests() {
       requests.clear();
       requestIds.clear();
+      peerAddresses.clear();
     }
 
     private synchronized void recordRequest(String method, AbstractMessage request) {
@@ -103,6 +111,12 @@ final class SharedBackendReplicaHarness implements Closeable {
 
     private synchronized void recordRequestId(String method, String requestId) {
       requestIds.computeIfAbsent(method, ignored -> new ArrayList<>()).add(requestId);
+    }
+
+    private synchronized void recordPeerAddress(String method, SocketAddress peerAddress) {
+      peerAddresses
+          .computeIfAbsent(method, ignored -> new ArrayList<>())
+          .add(peerAddress == null ? "unknown" : peerAddress.toString());
     }
 
     private synchronized Throwable nextError(String method) {
@@ -265,6 +279,9 @@ final class SharedBackendReplicaHarness implements Closeable {
           @Override
           public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
               ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
+            service.recordPeerAddress(
+                call.getMethodDescriptor().getBareMethodName(),
+                call.getAttributes().get(Grpc.TRANSPORT_ATTR_REMOTE_ADDR));
             service.recordRequestId(
                 call.getMethodDescriptor().getBareMethodName(),
                 headers.get(XGoogSpannerRequestId.REQUEST_ID_HEADER_KEY));

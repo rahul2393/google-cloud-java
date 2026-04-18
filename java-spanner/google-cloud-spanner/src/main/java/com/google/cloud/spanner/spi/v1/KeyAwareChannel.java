@@ -107,18 +107,25 @@ final class KeyAwareChannel extends ManagedChannel {
 
   private KeyAwareChannel(
       InstantiatingGrpcChannelProvider channelProvider,
-      @Nullable ChannelEndpointCacheFactory endpointCacheFactory)
+      @Nullable ChannelEndpointCacheFactory endpointCacheFactory,
+      @Nullable GrpcGcpEndpointChannelConfigurator endpointChannelConfigurator)
       throws IOException {
-    this(channelProvider, endpointCacheFactory, new EndpointOverloadCooldownTracker());
+    this(
+        channelProvider,
+        endpointCacheFactory,
+        endpointChannelConfigurator,
+        new EndpointOverloadCooldownTracker());
   }
 
   private KeyAwareChannel(
       InstantiatingGrpcChannelProvider channelProvider,
       @Nullable ChannelEndpointCacheFactory endpointCacheFactory,
+      @Nullable GrpcGcpEndpointChannelConfigurator endpointChannelConfigurator,
       EndpointOverloadCooldownTracker endpointOverloadCooldowns)
       throws IOException {
     if (endpointCacheFactory == null) {
-      this.endpointCache = new GrpcChannelEndpointCache(channelProvider);
+      this.endpointCache =
+          new GrpcChannelEndpointCache(channelProvider, endpointChannelConfigurator);
     } else {
       this.endpointCache = endpointCacheFactory.create(channelProvider);
     }
@@ -137,7 +144,15 @@ final class KeyAwareChannel extends ManagedChannel {
       InstantiatingGrpcChannelProvider channelProvider,
       @Nullable ChannelEndpointCacheFactory endpointCacheFactory)
       throws IOException {
-    return new KeyAwareChannel(channelProvider, endpointCacheFactory);
+    return new KeyAwareChannel(channelProvider, endpointCacheFactory, null);
+  }
+
+  static KeyAwareChannel create(
+      InstantiatingGrpcChannelProvider channelProvider,
+      @Nullable ChannelEndpointCacheFactory endpointCacheFactory,
+      @Nullable GrpcGcpEndpointChannelConfigurator endpointChannelConfigurator)
+      throws IOException {
+    return new KeyAwareChannel(channelProvider, endpointCacheFactory, endpointChannelConfigurator);
   }
 
   @VisibleForTesting
@@ -146,7 +161,8 @@ final class KeyAwareChannel extends ManagedChannel {
       @Nullable ChannelEndpointCacheFactory endpointCacheFactory,
       EndpointOverloadCooldownTracker endpointOverloadCooldowns)
       throws IOException {
-    return new KeyAwareChannel(channelProvider, endpointCacheFactory, endpointOverloadCooldowns);
+    return new KeyAwareChannel(
+        channelProvider, endpointCacheFactory, null, endpointOverloadCooldowns);
   }
 
   private static final class ChannelFinderReference extends SoftReference<ChannelFinder> {

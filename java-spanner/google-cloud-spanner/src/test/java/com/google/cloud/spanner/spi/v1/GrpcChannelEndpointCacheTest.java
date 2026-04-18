@@ -73,6 +73,28 @@ public class GrpcChannelEndpointCacheTest {
   }
 
   @Test
+  public void routedChannelsUseSingleUnderlyingChannel() throws Exception {
+    InstantiatingGrpcChannelProvider provider =
+        InstantiatingGrpcChannelProvider.newBuilder()
+            .setEndpoint("localhost:1234")
+            .setPoolSize(4)
+            .setChannelConfigurator(ManagedChannelBuilder::usePlaintext)
+            .build();
+    GrpcChannelEndpointCache cache = new GrpcChannelEndpointCache(provider);
+    try {
+      InstantiatingGrpcChannelProvider routedProvider =
+          cache.createProviderWithAuthorityOverride("localhost:1111");
+
+      assertThat(provider.toBuilder().getPoolSize()).isEqualTo(4);
+      assertThat(routedProvider.getChannelPoolSettings().getInitialChannelCount()).isEqualTo(1);
+      assertThat(routedProvider.getChannelPoolSettings().getMinChannelCount()).isEqualTo(1);
+      assertThat(routedProvider.getChannelPoolSettings().getMaxChannelCount()).isEqualTo(1);
+    } finally {
+      cache.shutdown();
+    }
+  }
+
+  @Test
   public void evictRemovesNonDefaultServer() throws Exception {
     GrpcChannelEndpointCache cache = new GrpcChannelEndpointCache(createProvider("localhost:1234"));
     try {

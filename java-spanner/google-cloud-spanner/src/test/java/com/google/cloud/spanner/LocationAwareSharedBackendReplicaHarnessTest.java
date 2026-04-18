@@ -50,7 +50,12 @@ import io.grpc.StatusRuntimeException;
 import io.grpc.protobuf.ProtoUtils;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -399,6 +404,59 @@ public class LocationAwareSharedBackendReplicaHarnessTest {
   }
 
   @Test
+  public void routedReplicaUsesSingleConnectionWhenDefaultPoolHasMultipleChannels()
+      throws Exception {
+    try (SharedBackendReplicaHarness harness = SharedBackendReplicaHarness.create(2);
+        Spanner spanner = createSpanner(harness, 4)) {
+      configureBackend(harness, singleRowReadResultSet("b"));
+      DatabaseClient client = spanner.getDatabaseClient(DatabaseId.of(PROJECT, INSTANCE, DATABASE));
+
+      seedLocationMetadata(client);
+      waitForReplicaRoutedRead(client, harness, 0);
+      harness.clearRequests();
+
+      ExecutorService executor = Executors.newFixedThreadPool(8);
+      try {
+        List<Future<?>> futures = new ArrayList<>();
+        for (int i = 0; i < 24; i++) {
+          futures.add(
+              executor.submit(
+                  () -> {
+                    try (ResultSet resultSet =
+                        client
+                            .singleUse()
+                            .read(
+                                TABLE,
+                                KeySet.singleKey(Key.of("b")),
+                                Arrays.asList("k"),
+                                Options.directedRead(DIRECTED_READ_OPTIONS))) {
+                      assertTrue(resultSet.next());
+                    }
+                  }));
+        }
+        for (Future<?> future : futures) {
+          future.get(10L, TimeUnit.SECONDS);
+        }
+      } finally {
+        executor.shutdownNow();
+        executor.awaitTermination(10L, TimeUnit.SECONDS);
+      }
+
+      Set<String> replicaPeers =
+          new HashSet<>(
+              harness
+                  .replicas
+                  .get(0)
+                  .getPeerAddresses(SharedBackendReplicaHarness.METHOD_STREAMING_READ));
+
+      assertEquals(
+          "location-aware replica channel should use one underlying direct endpoint connection",
+          1,
+          replicaPeers.size());
+    }
+  }
+
+  @Test
   public void singleUseReadMidStreamRecvFailureWithoutRetryInfoRetriesForBypassTraffic()
       throws Exception {
     try (SharedBackendReplicaHarness harness = SharedBackendReplicaHarness.create(2);
@@ -480,14 +538,21 @@ public class LocationAwareSharedBackendReplicaHarnessTest {
   }
 
   private static Spanner createSpanner(SharedBackendReplicaHarness harness) {
-    return SpannerOptions.newBuilder()
-        .usePlainText()
-        .setExperimentalHost(harness.defaultAddress)
-        .setProjectId(PROJECT)
-        .setCredentials(NoCredentials.getInstance())
-        .setChannelEndpointCacheFactory(null)
-        .build()
-        .getService();
+    return createSpanner(harness, null);
+  }
+
+  private static Spanner createSpanner(SharedBackendReplicaHarness harness, Integer numChannels) {
+    SpannerOptions.Builder builder =
+        SpannerOptions.newBuilder()
+            .usePlainText()
+            .setExperimentalHost(harness.defaultAddress)
+            .setProjectId(PROJECT)
+            .setCredentials(NoCredentials.getInstance())
+            .setChannelEndpointCacheFactory(null);
+    if (numChannels != null) {
+      builder.setNumChannels(numChannels);
+    }
+    return builder.build().getService();
   }
 
   private static void configureBackend(

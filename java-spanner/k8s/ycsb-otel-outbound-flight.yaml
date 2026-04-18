@@ -82,6 +82,12 @@ spec:
               value: "10"
             - name: YCSB_ENABLE_OTEL_TRACING
               value: "true"
+            - name: YCSB_ENABLE_PERFMARK
+              value: "true"
+            - name: YCSB_PERFMARK_TRACE_FILE
+              value: "/tmp/perfmark-$(POD_NAME).html"
+            - name: YCSB_PERFMARK_TRIGGER_FILE
+              value: "/tmp/perfmark-$(POD_NAME).trigger"
             - name: SPANNER_USE_OPENTELEMETRY_TRACING
               value: "true"
             - name: SPANNER_ENABLE_API_TRACING

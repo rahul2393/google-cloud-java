@@ -211,6 +211,7 @@ public class CloudSpannerClient extends DB {
             // Since we have no read-write transactions, we can set the write session fraction to 0.
             .setWriteSessionsFraction(0)
             .build());
+    PerfMarkSupport.configure(properties);
     if (host != null) {
       optionsBuilder.setHost(host);
     }
@@ -298,6 +299,7 @@ public class CloudSpannerClient extends DB {
         @Override
         public void run() {
           spanner.close();
+          PerfMarkSupport.shutdown();
           OpenTelemetrySupport.shutdown();
         }
       });
@@ -386,6 +388,12 @@ public class CloudSpannerClient extends DB {
           .append(OpenTelemetrySupport.getConfiguredClientName())
           .append("\nExport Spanner built-in metrics to OTEL: ")
           .append(OpenTelemetrySupport.isExportBuiltInMetricsEnabled())
+          .append("\nPerfMark enabled: ")
+          .append(PerfMarkSupport.isEnabled())
+          .append("\nPerfMark output file: ")
+          .append(PerfMarkSupport.getConfiguredOutputFile())
+          .append("\nPerfMark trigger file: ")
+          .append(PerfMarkSupport.getConfiguredTriggerFile())
           .toString());
     }
   }
@@ -426,6 +434,8 @@ public class CloudSpannerClient extends DB {
       String table, String key, Set<String> fields, Map<String, ByteIterator> result) {
     Span span = OpenTelemetrySupport.startOperationSpan("read", table);
     long startNanos = System.nanoTime();
+    PerfMarkSupport.startTask("ycsb.read", table);
+    PerfMarkSupport.attachTag("key", key);
     Status status = Status.ERROR;
     Throwable error = null;
     try (Scope scope = OpenTelemetrySupport.makeCurrent(span)) {
@@ -446,6 +456,7 @@ public class CloudSpannerClient extends DB {
       }
       return status;
     } finally {
+      PerfMarkSupport.stopTask(status, error);
       OpenTelemetrySupport.finishSpan(span, status, error, startNanos);
     }
   }
@@ -498,6 +509,8 @@ public class CloudSpannerClient extends DB {
       Vector<HashMap<String, ByteIterator>> result) {
     Span span = OpenTelemetrySupport.startOperationSpan("scan", table);
     long startNanos = System.nanoTime();
+    PerfMarkSupport.startTask("ycsb.scan", table);
+    PerfMarkSupport.attachTag("start_key", startKey);
     Status status = Status.ERROR;
     Throwable error = null;
     try (Scope scope = OpenTelemetrySupport.makeCurrent(span)) {
@@ -525,6 +538,7 @@ public class CloudSpannerClient extends DB {
       }
       return status;
     } finally {
+      PerfMarkSupport.stopTask(status, error);
       OpenTelemetrySupport.finishSpan(span, status, error, startNanos);
     }
   }
@@ -533,6 +547,8 @@ public class CloudSpannerClient extends DB {
   public Status update(String table, String key, Map<String, ByteIterator> values) {
     Span span = OpenTelemetrySupport.startOperationSpan("update", table);
     long startNanos = System.nanoTime();
+    PerfMarkSupport.startTask("ycsb.update", table);
+    PerfMarkSupport.attachTag("key", key);
     Status status = Status.ERROR;
     Throwable error = null;
     try (Scope scope = OpenTelemetrySupport.makeCurrent(span)) {
@@ -551,6 +567,7 @@ public class CloudSpannerClient extends DB {
       }
       return status;
     } finally {
+      PerfMarkSupport.stopTask(status, error);
       OpenTelemetrySupport.finishSpan(span, status, error, startNanos);
     }
   }
@@ -559,6 +576,8 @@ public class CloudSpannerClient extends DB {
   public Status insert(String table, String key, Map<String, ByteIterator> values) {
     Span span = OpenTelemetrySupport.startOperationSpan("insert", table);
     long startNanos = System.nanoTime();
+    PerfMarkSupport.startTask("ycsb.insert", table);
+    PerfMarkSupport.attachTag("key", key);
     Status status = Status.ERROR;
     Throwable error = null;
     try (Scope scope = OpenTelemetrySupport.makeCurrent(span)) {
@@ -591,6 +610,7 @@ public class CloudSpannerClient extends DB {
       }
       return status;
     } finally {
+      PerfMarkSupport.stopTask(status, error);
       OpenTelemetrySupport.finishSpan(span, status, error, startNanos);
     }
   }
@@ -598,6 +618,7 @@ public class CloudSpannerClient extends DB {
   @Override
   public void cleanup() {
     try {
+      PerfMarkSupport.event("ycsb.cleanup");
       if (bufferedMutations.size() > 0) {
         dbClient.writeAtLeastOnce(bufferedMutations);
         bufferedMutations.clear();
@@ -611,6 +632,8 @@ public class CloudSpannerClient extends DB {
   public Status delete(String table, String key) {
     Span span = OpenTelemetrySupport.startOperationSpan("delete", table);
     long startNanos = System.nanoTime();
+    PerfMarkSupport.startTask("ycsb.delete", table);
+    PerfMarkSupport.attachTag("key", key);
     Status status = Status.ERROR;
     Throwable error = null;
     try (Scope scope = OpenTelemetrySupport.makeCurrent(span)) {
@@ -624,6 +647,7 @@ public class CloudSpannerClient extends DB {
       }
       return status;
     } finally {
+      PerfMarkSupport.stopTask(status, error);
       OpenTelemetrySupport.finishSpan(span, status, error, startNanos);
     }
   }

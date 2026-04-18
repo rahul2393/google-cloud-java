@@ -282,13 +282,13 @@ final class OpenTelemetrySupport {
         "Configured YCSB OTEL support: project={0}, service={1}, metricPrefix={2}, "
             + "clientName={3}, metricsEnabled={4}, tracingEnabled={5}, exportBuiltInMetrics={6}",
         new Object[] {
-          configuredProjectId,
-          configuredServiceName,
-          configuredMetricPrefix,
-          configuredClientName,
-          metricsEnabled,
-          tracingEnabled,
-          exportBuiltInMetricsEnabled
+            configuredProjectId,
+            configuredServiceName,
+            configuredMetricPrefix,
+            configuredClientName,
+            metricsEnabled,
+            tracingEnabled,
+            exportBuiltInMetricsEnabled
         });
     return openTelemetrySdk;
   }

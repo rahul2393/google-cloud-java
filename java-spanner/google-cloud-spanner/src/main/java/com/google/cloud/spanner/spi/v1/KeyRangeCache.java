@@ -691,7 +691,26 @@ public final class KeyRangeCache {
               resolvedEndpoints,
               selectionStats);
       if (selected == null) {
-        return RouteLookupResult.failed(selectionStats.toFailureReason());
+        RouteFailureReason failureReason = selectionStats.toFailureReason();
+        if (failureReason == RouteFailureReason.ALL_EXCLUDED_OR_COOLDOWN) {
+          selected =
+              selectRandomExcludedOrCoolingDownTablet(
+                  snapshot, directedReadOptions, hintBuilder, resolvedEndpoints);
+          if (selected != null) {
+            recordKnownTransientFailures(
+                snapshot,
+                selected,
+                directedReadOptions,
+                hintBuilder,
+                excludedEndpoints,
+                skippedTabletUids,
+                resolvedEndpoints);
+            hintBuilder.setTabletUid(selected.tabletUid);
+            return RouteLookupResult.routed(
+                resolveEndpoint(selected, resolvedEndpoints), endpointLabel(snapshot, selected));
+          }
+        }
+        return RouteLookupResult.failed(failureReason);
       }
       recordKnownTransientFailures(
           snapshot,
@@ -756,6 +775,37 @@ public final class KeyRangeCache {
         return tablet;
       }
       return null;
+    }
+
+    @javax.annotation.Nullable
+    private TabletSnapshot selectRandomExcludedOrCoolingDownTablet(
+        GroupSnapshot snapshot,
+        DirectedReadOptions directedReadOptions,
+        RoutingHint.Builder hintBuilder,
+        Map<String, ChannelEndpoint> resolvedEndpoints) {
+      List<TabletSnapshot> candidates = new ArrayList<>();
+      for (TabletSnapshot tablet : snapshot.tablets) {
+        if (!tablet.matches(directedReadOptions)
+            || tablet.skip
+            || tablet.serverAddress.isEmpty()) {
+          continue;
+        }
+        ChannelEndpoint endpoint = resolveEndpoint(tablet, resolvedEndpoints);
+        if (endpoint == null || !endpoint.isHealthy()) {
+          continue;
+        }
+        candidates.add(tablet);
+      }
+      if (candidates.isEmpty()) {
+        return null;
+      }
+      int index =
+          uniformRandom(
+              candidates.size(),
+              hintBuilder.getKey(),
+              hintBuilder.getLimitKey(),
+              snapshot.generation);
+      return candidates.get(index);
     }
 
     private void recordKnownTransientFailures(

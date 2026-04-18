@@ -151,7 +151,7 @@ public class KeyRangeCacheTest {
   }
 
   @Test
-  public void lookupRoutingHintReportsAllExcludedOrCooldown() {
+  public void lookupRoutingHintReusesReplicaWhenAllCandidatesAreExcludedOrCoolingDown() {
     FakeEndpointCache endpointCache = new FakeEndpointCache();
     KeyRangeCache cache = new KeyRangeCache(endpointCache);
     cache.addRanges(singleReplicaUpdate("server1"));
@@ -166,8 +166,9 @@ public class KeyRangeCacheTest {
             hint,
             "server1"::equals);
 
-    assertNull(result.endpoint);
-    assertEquals(KeyRangeCache.RouteFailureReason.ALL_EXCLUDED_OR_COOLDOWN, result.failureReason);
+    assertNotNull(result.endpoint);
+    assertEquals("server1", result.endpoint.getAddress());
+    assertEquals(KeyRangeCache.RouteFailureReason.NONE, result.failureReason);
   }
 
   @Test

@@ -708,7 +708,7 @@ public class KeyAwareChannelTest {
   }
 
   @Test
-  public void resourceExhaustedRoutedEndpointFallsBackToDefaultWhenNoReplicaExists()
+  public void resourceExhaustedRoutedEndpointRetriesSameReplicaWhenAllReplicasAreExcluded()
       throws Exception {
     TestHarness harness = createHarness();
     CallOptions retryCallOptions = retryCallOptions(3L);
@@ -738,8 +738,8 @@ public class KeyAwareChannelTest {
     secondCall.start(new CapturingListener<ResultSet>(), new Metadata());
     secondCall.sendMessage(request);
 
-    assertThat(harness.endpointCache.callCountForAddress("server-a:1234")).isEqualTo(1);
-    assertThat(harness.defaultManagedChannel.callCount()).isEqualTo(2);
+    assertThat(harness.endpointCache.callCountForAddress("server-a:1234")).isEqualTo(2);
+    assertThat(harness.defaultManagedChannel.callCount()).isEqualTo(1);
   }
 
   @Test

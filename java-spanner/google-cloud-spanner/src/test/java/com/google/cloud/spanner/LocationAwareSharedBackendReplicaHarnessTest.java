@@ -409,6 +409,88 @@ public class LocationAwareSharedBackendReplicaHarnessTest {
   }
 
   @Test
+  public void singleUseReadRetriesRoutedReplicaWhenAllReplicasAreExcludedOrCoolingDown()
+      throws Exception {
+    try (SharedBackendReplicaHarness harness = SharedBackendReplicaHarness.create(2);
+        Spanner spanner = createSpanner(harness)) {
+      configureBackend(harness, singleRowReadResultSet("b"));
+      DatabaseClient client = spanner.getDatabaseClient(DatabaseId.of(PROJECT, INSTANCE, DATABASE));
+
+      seedLocationMetadata(client);
+      waitForReplicaRoutedRead(client, harness, 0);
+      harness.clearRequests();
+
+      harness
+          .replicas
+          .get(0)
+          .putMethodErrors(
+              SharedBackendReplicaHarness.METHOD_STREAMING_READ,
+              resourceExhaustedWithRetryInfo("leader-overloaded"));
+      harness
+          .replicas
+          .get(1)
+          .putMethodErrors(
+              SharedBackendReplicaHarness.METHOD_STREAMING_READ,
+              resourceExhaustedWithRetryInfo("replica-overloaded"));
+
+      try (ResultSet resultSet =
+          client
+              .singleUse()
+              .read(
+                  TABLE,
+                  KeySet.singleKey(Key.of("b")),
+                  Arrays.asList("k"),
+                  Options.directedRead(DIRECTED_READ_OPTIONS))) {
+        assertTrue(resultSet.next());
+      }
+
+      int replica0Requests =
+          harness
+              .replicas
+              .get(0)
+              .getRequests(SharedBackendReplicaHarness.METHOD_STREAMING_READ)
+              .size();
+      int replica1Requests =
+          harness
+              .replicas
+              .get(1)
+              .getRequests(SharedBackendReplicaHarness.METHOD_STREAMING_READ)
+              .size();
+      assertEquals(3, replica0Requests + replica1Requests);
+      assertTrue(replica0Requests >= 1);
+      assertTrue(replica1Requests >= 1);
+      assertEquals(
+          0,
+          harness
+              .defaultReplica
+              .getRequests(SharedBackendReplicaHarness.METHOD_STREAMING_READ)
+              .size());
+
+      List<String> allRequestIds = new ArrayList<>();
+      allRequestIds.addAll(
+          harness
+              .replicas
+              .get(0)
+              .getRequestIds(SharedBackendReplicaHarness.METHOD_STREAMING_READ));
+      allRequestIds.addAll(
+          harness
+              .replicas
+              .get(1)
+              .getRequestIds(SharedBackendReplicaHarness.METHOD_STREAMING_READ));
+      assertEquals(3, allRequestIds.size());
+
+      String logicalRequestKey = XGoogSpannerRequestId.of(allRequestIds.get(0)).getLogicalRequestKey();
+      Set<Long> attempts = new HashSet<>();
+      for (String requestId : allRequestIds) {
+        XGoogSpannerRequestId parsed = XGoogSpannerRequestId.of(requestId);
+        assertEquals(logicalRequestKey, parsed.getLogicalRequestKey());
+        attempts.add(parsed.getAttempt());
+      }
+      assertThat(attempts).containsExactly(1L, 2L, 3L);
+    }
+  }
+
+  @Test
   public void singleUseReadReroutesOnUnavailableForBypassTraffic() throws Exception {
     try (SharedBackendReplicaHarness harness = SharedBackendReplicaHarness.create(2);
         Spanner spanner = createSpanner(harness)) {

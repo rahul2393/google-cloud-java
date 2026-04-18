@@ -239,18 +239,18 @@ class BuiltInMetricsTracer extends MetricsTracer implements ApiTracer {
       return;
     }
     UnknownStatusClassification classification = classifyUnknownStatus(originalError);
-    logger.log(
-        Level.WARNING,
-        "Built-in metrics exported status=UNKNOWN for {0}; classification={1}, method={2},"
-            + " target_endpoint={3}, original_error_chain={4}, metrics_error_chain={5}",
-        new Object[] {
-          eventType,
-          classification.logValue,
-          attributes.get(METHOD_ATTRIBUTE),
-          attributes.get(BuiltInMetricsConstant.TARGET_ENDPOINT_KEY.getKey()),
-          formatThrowableChain(originalError),
-          formatThrowableChain(metricsError)
-        });
+    String message =
+        String.format(
+            "Built-in metrics exported status=UNKNOWN for %s; classification=%s, method=%s,"
+                + " target_endpoint=%s, original_error_chain=%s, metrics_error_chain=%s",
+            eventType,
+            classification.logValue,
+            attributes.get(METHOD_ATTRIBUTE),
+            attributes.get(BuiltInMetricsConstant.TARGET_ENDPOINT_KEY.getKey()),
+            formatThrowableChain(originalError),
+            formatThrowableChain(metricsError));
+    logger.log(Level.WARNING, message);
+    System.err.println(message);
   }
 
   private static Throwable normalizeErrorForMetrics(@Nullable Throwable error) {

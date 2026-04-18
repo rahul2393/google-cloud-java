@@ -411,6 +411,8 @@ final class OpenTelemetrySupport {
     }
 
     setLoggerLevel(logManager, OpenTelemetrySupport.class.getName(), Level.FINE);
+    setLoggerLevel(logManager, "com.google.cloud.spanner", Level.FINE);
+    setLoggerLevel(logManager, "com.google.cloud.spanner.BuiltInMetricsTracer", Level.FINE);
     setLoggerLevel(logManager, "com.google.cloud.opentelemetry.metric", Level.FINEST);
     setLoggerLevel(logManager, "com.google.cloud.monitoring.v3", Level.FINEST);
     setLoggerLevel(logManager, "com.google.api.gax", Level.FINEST);

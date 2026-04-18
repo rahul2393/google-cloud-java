@@ -133,6 +133,65 @@ public class KeyRangeCacheTest {
   }
 
   @Test
+  public void lookupRoutingHintReportsCacheMiss() {
+    FakeEndpointCache endpointCache = new FakeEndpointCache();
+    KeyRangeCache cache = new KeyRangeCache(endpointCache);
+
+    RoutingHint.Builder hint = RoutingHint.newBuilder().setKey(bytes("a"));
+    KeyRangeCache.RouteLookupResult result =
+        cache.lookupRoutingHint(
+            false,
+            KeyRangeCache.RangeMode.COVERING_SPLIT,
+            DirectedReadOptions.getDefaultInstance(),
+            hint,
+            address -> false);
+
+    assertNull(result.endpoint);
+    assertEquals(KeyRangeCache.RouteFailureReason.CACHE_MISS, result.failureReason);
+  }
+
+  @Test
+  public void lookupRoutingHintReportsAllExcludedOrCooldown() {
+    FakeEndpointCache endpointCache = new FakeEndpointCache();
+    KeyRangeCache cache = new KeyRangeCache(endpointCache);
+    cache.addRanges(singleReplicaUpdate("server1"));
+    endpointCache.get("server1");
+
+    RoutingHint.Builder hint = RoutingHint.newBuilder().setKey(bytes("a"));
+    KeyRangeCache.RouteLookupResult result =
+        cache.lookupRoutingHint(
+            false,
+            KeyRangeCache.RangeMode.COVERING_SPLIT,
+            DirectedReadOptions.getDefaultInstance(),
+            hint,
+            "server1"::equals);
+
+    assertNull(result.endpoint);
+    assertEquals(KeyRangeCache.RouteFailureReason.ALL_EXCLUDED_OR_COOLDOWN, result.failureReason);
+  }
+
+  @Test
+  public void lookupRoutingHintReportsNoReadyReplica() {
+    FakeEndpointCache endpointCache = new FakeEndpointCache();
+    KeyRangeCache cache = new KeyRangeCache(endpointCache);
+    cache.addRanges(singleReplicaUpdate("server1"));
+    endpointCache.get("server1");
+    endpointCache.setState("server1", EndpointHealthState.IDLE);
+
+    RoutingHint.Builder hint = RoutingHint.newBuilder().setKey(bytes("a"));
+    KeyRangeCache.RouteLookupResult result =
+        cache.lookupRoutingHint(
+            false,
+            KeyRangeCache.RangeMode.COVERING_SPLIT,
+            DirectedReadOptions.getDefaultInstance(),
+            hint,
+            address -> false);
+
+    assertNull(result.endpoint);
+    assertEquals(KeyRangeCache.RouteFailureReason.NO_READY_REPLICA, result.failureReason);
+  }
+
+  @Test
   public void shrinkToEvictsRanges() {
     FakeEndpointCache endpointCache = new FakeEndpointCache();
     KeyRangeCache cache = new KeyRangeCache(endpointCache);

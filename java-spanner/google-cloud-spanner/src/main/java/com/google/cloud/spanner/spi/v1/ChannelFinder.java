@@ -282,6 +282,11 @@ public final class ChannelFinder {
     return findServer(reqBuilder, preferLeader(reqBuilder.getTransaction()), excludedEndpoints);
   }
 
+  KeyRangeCache.RouteLookupResult findServerResult(
+      ReadRequest.Builder reqBuilder, Predicate<String> excludedEndpoints) {
+    return findServerResult(reqBuilder, preferLeader(reqBuilder.getTransaction()), excludedEndpoints);
+  }
+
   public ChannelEndpoint findServer(ReadRequest.Builder reqBuilder, boolean preferLeader) {
     return findServer(reqBuilder, preferLeader, NO_EXCLUDED_ENDPOINTS);
   }
@@ -289,7 +294,19 @@ public final class ChannelFinder {
   public ChannelEndpoint findServer(
       ReadRequest.Builder reqBuilder, boolean preferLeader, Predicate<String> excludedEndpoints) {
     recipeCache.computeKeys(reqBuilder);
-    return fillRoutingHint(
+    return lookupRoutingHint(
+            preferLeader,
+            KeyRangeCache.RangeMode.COVERING_SPLIT,
+            reqBuilder.getDirectedReadOptions(),
+            reqBuilder.getRoutingHintBuilder(),
+            excludedEndpoints)
+        .endpoint;
+  }
+
+  KeyRangeCache.RouteLookupResult findServerResult(
+      ReadRequest.Builder reqBuilder, boolean preferLeader, Predicate<String> excludedEndpoints) {
+    recipeCache.computeKeys(reqBuilder);
+    return lookupRoutingHint(
         preferLeader,
         KeyRangeCache.RangeMode.COVERING_SPLIT,
         reqBuilder.getDirectedReadOptions(),
@@ -306,6 +323,11 @@ public final class ChannelFinder {
     return findServer(reqBuilder, preferLeader(reqBuilder.getTransaction()), excludedEndpoints);
   }
 
+  KeyRangeCache.RouteLookupResult findServerResult(
+      ExecuteSqlRequest.Builder reqBuilder, Predicate<String> excludedEndpoints) {
+    return findServerResult(reqBuilder, preferLeader(reqBuilder.getTransaction()), excludedEndpoints);
+  }
+
   public ChannelEndpoint findServer(ExecuteSqlRequest.Builder reqBuilder, boolean preferLeader) {
     return findServer(reqBuilder, preferLeader, NO_EXCLUDED_ENDPOINTS);
   }
@@ -315,7 +337,21 @@ public final class ChannelFinder {
       boolean preferLeader,
       Predicate<String> excludedEndpoints) {
     recipeCache.computeKeys(reqBuilder);
-    return fillRoutingHint(
+    return lookupRoutingHint(
+            preferLeader,
+            KeyRangeCache.RangeMode.PICK_RANDOM,
+            reqBuilder.getDirectedReadOptions(),
+            reqBuilder.getRoutingHintBuilder(),
+            excludedEndpoints)
+        .endpoint;
+  }
+
+  KeyRangeCache.RouteLookupResult findServerResult(
+      ExecuteSqlRequest.Builder reqBuilder,
+      boolean preferLeader,
+      Predicate<String> excludedEndpoints) {
+    recipeCache.computeKeys(reqBuilder);
+    return lookupRoutingHint(
         preferLeader,
         KeyRangeCache.RangeMode.PICK_RANDOM,
         reqBuilder.getDirectedReadOptions(),
@@ -332,7 +368,20 @@ public final class ChannelFinder {
     if (!reqBuilder.hasMutationKey()) {
       return null;
     }
-    return routeMutation(
+    return routeMutationResult(
+            reqBuilder.getMutationKey(),
+            preferLeader(reqBuilder.getOptions()),
+            reqBuilder.getRoutingHintBuilder(),
+            excludedEndpoints)
+        .endpoint;
+  }
+
+  KeyRangeCache.RouteLookupResult findServerResult(
+      BeginTransactionRequest.Builder reqBuilder, Predicate<String> excludedEndpoints) {
+    if (!reqBuilder.hasMutationKey()) {
+      return KeyRangeCache.RouteLookupResult.failed(KeyRangeCache.RouteFailureReason.NONE);
+    }
+    return routeMutationResult(
         reqBuilder.getMutationKey(),
         preferLeader(reqBuilder.getOptions()),
         reqBuilder.getRoutingHintBuilder(),
@@ -349,7 +398,18 @@ public final class ChannelFinder {
     if (mutation == null) {
       return null;
     }
-    return routeMutation(
+    return routeMutationResult(
+            mutation, /* preferLeader= */ true, reqBuilder.getRoutingHintBuilder(), excludedEndpoints)
+        .endpoint;
+  }
+
+  KeyRangeCache.RouteLookupResult fillRoutingHintResult(
+      CommitRequest.Builder reqBuilder, Predicate<String> excludedEndpoints) {
+    Mutation mutation = selectMutationForRouting(reqBuilder.getMutationsList());
+    if (mutation == null) {
+      return KeyRangeCache.RouteLookupResult.failed(KeyRangeCache.RouteFailureReason.NONE);
+    }
+    return routeMutationResult(
         mutation, /* preferLeader= */ true, reqBuilder.getRoutingHintBuilder(), excludedEndpoints);
   }
 
@@ -377,7 +437,7 @@ public final class ChannelFinder {
     return largestInsertMutation;
   }
 
-  private ChannelEndpoint routeMutation(
+  private KeyRangeCache.RouteLookupResult routeMutationResult(
       Mutation mutation,
       boolean preferLeader,
       RoutingHint.Builder hintBuilder,
@@ -385,10 +445,10 @@ public final class ChannelFinder {
     recipeCache.applySchemaGeneration(hintBuilder);
     TargetRange target = recipeCache.mutationToTargetRange(mutation);
     if (target == null) {
-      return null;
+      return KeyRangeCache.RouteLookupResult.failed(KeyRangeCache.RouteFailureReason.CACHE_MISS);
     }
     recipeCache.applyTargetRange(hintBuilder, target);
-    return fillRoutingHint(
+    return lookupRoutingHint(
         preferLeader,
         KeyRangeCache.RangeMode.COVERING_SPLIT,
         DirectedReadOptions.getDefaultInstance(),
@@ -396,7 +456,7 @@ public final class ChannelFinder {
         excludedEndpoints);
   }
 
-  private ChannelEndpoint fillRoutingHint(
+  private KeyRangeCache.RouteLookupResult lookupRoutingHint(
       boolean preferLeader,
       KeyRangeCache.RangeMode rangeMode,
       DirectedReadOptions directedReadOptions,
@@ -404,10 +464,10 @@ public final class ChannelFinder {
       Predicate<String> excludedEndpoints) {
     long id = databaseId.get();
     if (id == 0) {
-      return null;
+      return KeyRangeCache.RouteLookupResult.failed(KeyRangeCache.RouteFailureReason.CACHE_MISS);
     }
     hintBuilder.setDatabaseId(id);
-    return rangeCache.fillRoutingHint(
+    return rangeCache.lookupRoutingHint(
         preferLeader, rangeMode, directedReadOptions, hintBuilder, excludedEndpoints);
   }
 

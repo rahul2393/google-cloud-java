@@ -527,6 +527,26 @@ final class KeyAwareChannel extends ManagedChannel {
     return nanos / 1_000_000d;
   }
 
+  private static String routeFailureReasonLabel(KeyRangeCache.RouteFailureReason failureReason) {
+    switch (failureReason) {
+      case MISSING_ROUTING_KEY:
+        return "missing_routing_key";
+      case CACHE_MISS:
+        return "cache_miss";
+      case ALL_EXCLUDED_OR_COOLDOWN:
+        return "all_excluded_or_cooldown";
+      case NO_READY_REPLICA:
+        return "no_ready_replica";
+      case NO_MATCHING_REPLICA:
+        return "no_matching_replica";
+      case NO_ROUTABLE_REPLICA:
+        return "no_routable_replica";
+      case NONE:
+      default:
+        return "unknown";
+    }
+  }
+
   private Map<String, Set<String>> snapshotEndpointStates() {
     Map<String, Set<String>> states = new HashMap<>();
     if (lifecycleManager != null) {
@@ -625,6 +645,8 @@ final class KeyAwareChannel extends ManagedChannel {
         Predicate<String> excludedEndpoints = excludedEndpoints();
         ChannelEndpoint endpoint = null;
         ChannelFinder finder = null;
+        String routingDecisionLabel = "default_host";
+        String routingReasonLabel = "unknown";
 
         if (message instanceof ReadRequest) {
           ReadRequest.Builder reqBuilder = ((ReadRequest) message).toBuilder();
@@ -632,6 +654,8 @@ final class KeyAwareChannel extends ManagedChannel {
           RoutingDecision routing = routeFromRequest(reqBuilder);
           finder = routing.finder;
           endpoint = routing.endpoint;
+          routingDecisionLabel = routing.decision;
+          routingReasonLabel = routing.reason;
           message = (RequestT) reqBuilder.build();
         } else if (message instanceof ExecuteSqlRequest) {
           ExecuteSqlRequest.Builder reqBuilder = ((ExecuteSqlRequest) message).toBuilder();
@@ -639,6 +663,8 @@ final class KeyAwareChannel extends ManagedChannel {
           RoutingDecision routing = routeFromRequest(reqBuilder);
           finder = routing.finder;
           endpoint = routing.endpoint;
+          routingDecisionLabel = routing.decision;
+          routingReasonLabel = routing.reason;
           message = (RequestT) reqBuilder.build();
         } else if (message instanceof BeginTransactionRequest) {
           BeginTransactionRequest.Builder reqBuilder =
@@ -648,7 +674,19 @@ final class KeyAwareChannel extends ManagedChannel {
             finder = parentChannel.getOrCreateChannelFinder(databaseId);
           }
           if (finder != null && reqBuilder.hasMutationKey()) {
-            endpoint = finder.findServer(reqBuilder, excludedEndpoints);
+            KeyRangeCache.RouteLookupResult routeLookup =
+                finder.findServerResult(reqBuilder, excludedEndpoints);
+            endpoint = routeLookup.endpoint;
+            if (endpoint != null) {
+              routingDecisionLabel = "routed_replica";
+              routingReasonLabel = "selected";
+            } else {
+              routingReasonLabel = routeFailureReasonLabel(routeLookup.failureReason);
+            }
+          } else if (databaseId == null) {
+            routingReasonLabel = "missing_database_id";
+          } else {
+            routingReasonLabel = "missing_mutation_key";
           }
           if (reqBuilder.hasOptions() && reqBuilder.getOptions().hasReadOnly()) {
             isReadOnlyBegin = true;
@@ -666,14 +704,28 @@ final class KeyAwareChannel extends ManagedChannel {
           CommitRequest.Builder reqBuilder = null;
           if (finder != null && request.getMutationsCount() > 0) {
             reqBuilder = request.toBuilder();
-            endpoint = finder.fillRoutingHint(reqBuilder, excludedEndpoints);
+            KeyRangeCache.RouteLookupResult routeLookup =
+                finder.fillRoutingHintResult(reqBuilder, excludedEndpoints);
+            endpoint = routeLookup.endpoint;
+            if (endpoint != null) {
+              routingDecisionLabel = "routed_replica";
+              routingReasonLabel = "selected";
+            } else {
+              routingReasonLabel = routeFailureReasonLabel(routeLookup.failureReason);
+            }
             request = reqBuilder.build();
+          } else if (databaseId == null) {
+            routingReasonLabel = "missing_database_id";
+          } else {
+            routingReasonLabel = "missing_mutation_key";
           }
           if (!request.getTransactionId().isEmpty()) {
             ChannelEndpoint affinityEndpoint =
                 parentChannel.affinityEndpoint(request.getTransactionId(), excludedEndpoints);
             if (affinityEndpoint != null) {
               endpoint = affinityEndpoint;
+              routingDecisionLabel = "affinity";
+              routingReasonLabel = "selected";
             }
             transactionIdToClear = request.getTransactionId();
           }
@@ -685,7 +737,15 @@ final class KeyAwareChannel extends ManagedChannel {
           if (!request.getTransactionId().isEmpty()) {
             endpoint =
                 parentChannel.affinityEndpoint(request.getTransactionId(), excludedEndpoints);
+            if (endpoint != null) {
+              routingDecisionLabel = "affinity";
+              routingReasonLabel = "selected";
+            } else {
+              routingReasonLabel = "no_affinity_endpoint";
+            }
             transactionIdToClear = request.getTransactionId();
+          } else {
+            routingReasonLabel = "missing_transaction_id";
           }
         } else {
           throw new IllegalStateException(
@@ -698,6 +758,17 @@ final class KeyAwareChannel extends ManagedChannel {
         }
         if (endpoint == null) {
           throw new IllegalStateException("No default endpoint available for key-aware call");
+        }
+        if (!parentChannel.defaultEndpointAddress.equals(endpoint.getAddress())) {
+          LocationAwareTelemetry.recordRoutingDecision(
+              routingDecisionLabel, routingReasonLabel, endpoint.getAddress(),
+              methodDescriptor.getFullMethodName());
+        } else {
+          LocationAwareTelemetry.recordRoutingDecision(
+              "default_host",
+              routingReasonLabel,
+              endpoint.getAddress(),
+              methodDescriptor.getFullMethodName());
         }
         selectedEndpoint = endpoint;
         this.channelFinder = finder;
@@ -888,18 +959,32 @@ final class KeyAwareChannel extends ManagedChannel {
       ChannelEndpoint endpoint =
           isReadOnly ? null : parentChannel.affinityEndpoint(transactionId, excludedEndpoints);
       ChannelFinder finder = null;
+      String decision = "default_host";
+      String reason = "unknown";
+      if (endpoint != null) {
+        return new RoutingDecision(null, endpoint, "affinity", "selected");
+      }
+      if (databaseId == null) {
+        return new RoutingDecision(null, null, decision, "missing_database_id");
+      }
       if (databaseId != null) {
         finder = parentChannel.getOrCreateChannelFinder(databaseId);
       }
-      if (databaseId != null && endpoint == null) {
+      if (endpoint == null) {
         Boolean preferLeaderOverride = parentChannel.readOnlyPreferLeader(transactionId);
-        ChannelEndpoint routed =
+        KeyRangeCache.RouteLookupResult routed =
             preferLeaderOverride != null
-                ? finder.findServer(reqBuilder, preferLeaderOverride, excludedEndpoints)
-                : finder.findServer(reqBuilder, excludedEndpoints);
-        endpoint = routed;
+                ? finder.findServerResult(reqBuilder, preferLeaderOverride, excludedEndpoints)
+                : finder.findServerResult(reqBuilder, excludedEndpoints);
+        endpoint = routed.endpoint;
+        if (endpoint != null) {
+          decision = "routed_replica";
+          reason = "selected";
+        } else {
+          reason = routeFailureReasonLabel(routed.failureReason);
+        }
       }
-      return new RoutingDecision(finder, endpoint);
+      return new RoutingDecision(finder, endpoint, decision, reason);
     }
 
     private RoutingDecision routeFromRequest(ExecuteSqlRequest.Builder reqBuilder) {
@@ -911,18 +996,32 @@ final class KeyAwareChannel extends ManagedChannel {
       ChannelEndpoint endpoint =
           isReadOnly ? null : parentChannel.affinityEndpoint(transactionId, excludedEndpoints);
       ChannelFinder finder = null;
+      String decision = "default_host";
+      String reason = "unknown";
+      if (endpoint != null) {
+        return new RoutingDecision(null, endpoint, "affinity", "selected");
+      }
+      if (databaseId == null) {
+        return new RoutingDecision(null, null, decision, "missing_database_id");
+      }
       if (databaseId != null) {
         finder = parentChannel.getOrCreateChannelFinder(databaseId);
       }
-      if (databaseId != null && endpoint == null) {
+      if (endpoint == null) {
         Boolean preferLeaderOverride = parentChannel.readOnlyPreferLeader(transactionId);
-        ChannelEndpoint routed =
+        KeyRangeCache.RouteLookupResult routed =
             preferLeaderOverride != null
-                ? finder.findServer(reqBuilder, preferLeaderOverride, excludedEndpoints)
-                : finder.findServer(reqBuilder, excludedEndpoints);
-        endpoint = routed;
+                ? finder.findServerResult(reqBuilder, preferLeaderOverride, excludedEndpoints)
+                : finder.findServerResult(reqBuilder, excludedEndpoints);
+        endpoint = routed.endpoint;
+        if (endpoint != null) {
+          decision = "routed_replica";
+          reason = "selected";
+        } else {
+          reason = routeFailureReasonLabel(routed.failureReason);
+        }
       }
-      return new RoutingDecision(finder, endpoint);
+      return new RoutingDecision(finder, endpoint, decision, reason);
     }
 
     private void enqueueCacheUpdate(com.google.spanner.v1.CacheUpdate cacheUpdate) {
@@ -940,10 +1039,18 @@ final class KeyAwareChannel extends ManagedChannel {
   private static final class RoutingDecision {
     @Nullable private final ChannelFinder finder;
     @Nullable private final ChannelEndpoint endpoint;
+    private final String decision;
+    private final String reason;
 
-    private RoutingDecision(@Nullable ChannelFinder finder, @Nullable ChannelEndpoint endpoint) {
+    private RoutingDecision(
+        @Nullable ChannelFinder finder,
+        @Nullable ChannelEndpoint endpoint,
+        String decision,
+        String reason) {
       this.finder = finder;
       this.endpoint = endpoint;
+      this.decision = decision;
+      this.reason = reason;
     }
   }
 

@@ -38,6 +38,7 @@ final class LocationAwareTelemetry {
   private static final AttributeKey<String> TARGET_ENDPOINT_KEY =
       AttributeKey.stringKey("target_endpoint");
   private static final AttributeKey<String> REASON_KEY = AttributeKey.stringKey("reason");
+  private static final AttributeKey<String> DECISION_KEY = AttributeKey.stringKey("decision");
   private static final Set<EndpointStateProvider> PROVIDERS = ConcurrentHashMap.newKeySet();
 
   private static final Meter METER =
@@ -75,6 +76,13 @@ final class LocationAwareTelemetry {
           .setDescription("Number of times location-aware routing skipped an endpoint.")
           .setUnit("1")
           .build();
+  private static final LongCounter ROUTING_DECISION_COUNTER =
+      METER
+          .counterBuilder("location_aware.routing_decision_count")
+          .setDescription(
+              "Final location-aware routing decision, including default-host fallback reasons.")
+          .setUnit("1")
+          .build();
 
   static {
     METER
@@ -102,21 +110,25 @@ final class LocationAwareTelemetry {
     METER
         .gaugeBuilder("location_aware.endpoint_state_count")
         .ofLongs()
-        .setDescription("Current count of location-aware endpoints by state.")
+        .setDescription("Current count of location-aware endpoint states by endpoint.")
         .setUnit("1")
         .buildWithCallback(
             measurement -> {
-              Map<String, Long> counts = new HashMap<>();
               mergeEndpointStates()
-                  .values()
                   .forEach(
-                      states -> {
+                      (address, states) -> {
+                        if (address == null || address.isEmpty()) {
+                          return;
+                        }
                         for (String state : states) {
-                          counts.merge(state, 1L, Long::sum);
+                          measurement.record(
+                              1L,
+                              Attributes.builder()
+                                  .put(TARGET_ENDPOINT_KEY, address)
+                                  .put(STATE_KEY, state)
+                                  .build());
                         }
                       });
-              counts.forEach(
-                  (state, count) -> measurement.record(count, Attributes.of(STATE_KEY, state)));
             });
   }
 
@@ -186,6 +198,20 @@ final class LocationAwareTelemetry {
       attributesBuilder.put(TARGET_ENDPOINT_KEY, targetEndpoint);
     }
     ENDPOINT_SKIP_COUNTER.add(1L, attributesBuilder.build());
+  }
+
+  static void recordRoutingDecision(
+      String decision, String reason, @Nullable String targetEndpoint, @Nullable String method) {
+    io.opentelemetry.api.common.AttributesBuilder attributesBuilder = Attributes.builder();
+    attributesBuilder.put(DECISION_KEY, decision == null ? "unknown" : decision);
+    attributesBuilder.put(REASON_KEY, reason == null ? "unknown" : reason);
+    if (method != null && !method.isEmpty()) {
+      attributesBuilder.put(METHOD_KEY, method);
+    }
+    if (targetEndpoint != null && !targetEndpoint.isEmpty()) {
+      attributesBuilder.put(TARGET_ENDPOINT_KEY, targetEndpoint);
+    }
+    ROUTING_DECISION_COUNTER.add(1L, attributesBuilder.build());
   }
 
   private static Attributes requestAttributes(

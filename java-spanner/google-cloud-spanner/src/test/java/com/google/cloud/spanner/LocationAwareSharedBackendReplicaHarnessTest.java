@@ -627,6 +627,75 @@ public class LocationAwareSharedBackendReplicaHarnessTest {
   }
 
   @Test
+  public void reroutedStreamingReadExportsUnavailableAttemptStatusForFailedReplica()
+      throws Exception {
+    InMemoryMetricReader metricReader = InMemoryMetricReader.create();
+    try (SharedBackendReplicaHarness harness = SharedBackendReplicaHarness.create(2);
+        Spanner spanner = createSpannerWithCustomExporter(harness, metricReader)) {
+      configureBackend(harness, singleRowReadResultSet("b"));
+      DatabaseClient client = spanner.getDatabaseClient(DatabaseId.of(PROJECT, INSTANCE, DATABASE));
+
+      seedLocationMetadata(client);
+      waitForReplicaRoutedRead(client, harness, 0);
+      harness.clearRequests();
+
+      harness
+          .replicas
+          .get(0)
+          .putMethodErrors(
+              SharedBackendReplicaHarness.METHOD_STREAMING_READ, unavailable("isolated-replica"));
+
+      try (ResultSet resultSet =
+          client
+              .singleUse()
+              .read(
+                  TABLE,
+                  KeySet.singleKey(Key.of("b")),
+                  Arrays.asList("k"),
+                  Options.directedRead(DIRECTED_READ_OPTIONS))) {
+        assertTrue(resultSet.next());
+      }
+
+      MetricData attemptCountMetric =
+          getMetricData(
+              metricReader,
+              BuiltInMetricsConstant.CUSTOM_EXPORT_METER_NAME
+                  + "/"
+                  + BuiltInMetricsConstant.ATTEMPT_COUNT_NAME);
+      assertNotNull(attemptCountMetric);
+      assertThat(attemptCountMetric.getLongSumData().getPoints()).isNotEmpty();
+
+      boolean foundUnavailableAttempt =
+          attemptCountMetric.getLongSumData().getPoints().stream()
+              .anyMatch(
+                  point ->
+                      point.getValue() > 0
+                          && "Spanner.StreamingRead"
+                              .equals(point.getAttributes().get(BuiltInMetricsConstant.METHOD_KEY))
+                          && "UNAVAILABLE"
+                              .equals(point.getAttributes().get(BuiltInMetricsConstant.STATUS_KEY)));
+      assertTrue(
+          "Expected UNAVAILABLE attempt status for rerouted streaming read: "
+              + attemptCountMetric.getLongSumData().getPoints(),
+          foundUnavailableAttempt);
+
+      boolean foundOkAttempt =
+          attemptCountMetric.getLongSumData().getPoints().stream()
+              .anyMatch(
+                  point ->
+                      point.getValue() > 0
+                          && "Spanner.StreamingRead"
+                              .equals(point.getAttributes().get(BuiltInMetricsConstant.METHOD_KEY))
+                          && "OK"
+                              .equals(point.getAttributes().get(BuiltInMetricsConstant.STATUS_KEY)));
+      assertTrue(
+          "Expected OK attempt status for successful rerouted streaming read: "
+              + attemptCountMetric.getLongSumData().getPoints(),
+          foundOkAttempt);
+    }
+  }
+
+  @Test
   public void singleUseReadCooldownSkipsUnavailableReplicaOnNextRequestForBypassTraffic()
       throws Exception {
     try (SharedBackendReplicaHarness harness = SharedBackendReplicaHarness.create(2);

@@ -16,7 +16,9 @@
 
 package com.google.cloud.spanner;
 
+import com.google.api.gax.grpc.GrpcStatusCode;
 import com.google.api.gax.rpc.ApiException;
+import com.google.api.gax.rpc.ApiExceptionFactory;
 import com.google.api.gax.rpc.StatusCode;
 import com.google.api.gax.tracing.ApiTracer;
 import com.google.api.gax.tracing.MethodName;
@@ -24,6 +26,8 @@ import com.google.api.gax.tracing.MetricsTracer;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CancellationException;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import javax.annotation.Nullable;
 
 /**
@@ -33,6 +37,7 @@ import javax.annotation.Nullable;
  * observed in the lifecycle of an RPC operation.
  */
 class BuiltInMetricsTracer extends MetricsTracer implements ApiTracer {
+  private static final Logger logger = Logger.getLogger(BuiltInMetricsTracer.class.getName());
 
   private final BuiltInMetricsRecorder builtInOpenTelemetryMetricsRecorder;
   private final boolean allowTargetEndpointAttribute;
@@ -98,8 +103,9 @@ class BuiltInMetricsTracer extends MetricsTracer implements ApiTracer {
   @Override
   public void attemptFailedDuration(Throwable error, java.time.Duration delay) {
     try (IScope s = this.traceWrapper.withSpan(this.currentSpan)) {
-      super.attemptFailedDuration(error, delay);
-      attributes.put(STATUS_ATTRIBUTE, extractStatus(error));
+      Throwable metricsError = normalizeErrorForMetrics(error);
+      super.attemptFailedDuration(metricsError, delay);
+      attributes.put(STATUS_ATTRIBUTE, updateStatusAndLogIfUnknown("attempt", error, metricsError));
       builtInOpenTelemetryMetricsRecorder.recordServerTimingHeaderMetrics(
           gfeLatency, afeLatency, attributes, isDirectPathUsed, isAfeEnabled);
     }
@@ -115,8 +121,11 @@ class BuiltInMetricsTracer extends MetricsTracer implements ApiTracer {
   @Override
   public void attemptFailedRetriesExhausted(Throwable error) {
     try (IScope s = this.traceWrapper.withSpan(this.currentSpan)) {
-      super.attemptFailedRetriesExhausted(error);
-      attributes.put(STATUS_ATTRIBUTE, extractStatus(error));
+      Throwable metricsError = normalizeErrorForMetrics(error);
+      super.attemptFailedRetriesExhausted(metricsError);
+      attributes.put(
+          STATUS_ATTRIBUTE,
+          updateStatusAndLogIfUnknown("attempt_retries_exhausted", error, metricsError));
       builtInOpenTelemetryMetricsRecorder.recordServerTimingHeaderMetrics(
           gfeLatency, afeLatency, attributes, isDirectPathUsed, isAfeEnabled);
     }
@@ -132,10 +141,22 @@ class BuiltInMetricsTracer extends MetricsTracer implements ApiTracer {
   @Override
   public void attemptPermanentFailure(Throwable error) {
     try (IScope s = this.traceWrapper.withSpan(this.currentSpan)) {
-      super.attemptPermanentFailure(error);
-      attributes.put(STATUS_ATTRIBUTE, extractStatus(error));
+      Throwable metricsError = normalizeErrorForMetrics(error);
+      super.attemptPermanentFailure(metricsError);
+      attributes.put(
+          STATUS_ATTRIBUTE,
+          updateStatusAndLogIfUnknown("attempt_permanent_failure", error, metricsError));
       builtInOpenTelemetryMetricsRecorder.recordServerTimingHeaderMetrics(
           gfeLatency, afeLatency, attributes, isDirectPathUsed, isAfeEnabled);
+    }
+  }
+
+  @Override
+  public void operationFailed(Throwable error) {
+    try (IScope s = this.traceWrapper.withSpan(this.currentSpan)) {
+      Throwable metricsError = normalizeErrorForMetrics(error);
+      logIfUnknownStatus("operation", error, metricsError);
+      super.operationFailed(metricsError);
     }
   }
 
@@ -178,18 +199,152 @@ class BuiltInMetricsTracer extends MetricsTracer implements ApiTracer {
   }
 
   private static String extractStatus(@Nullable Throwable error) {
-    final String statusString;
-
     if (error == null) {
       return StatusCode.Code.OK.toString();
-    } else if (error instanceof CancellationException) {
-      statusString = StatusCode.Code.CANCELLED.toString();
-    } else if (error instanceof ApiException) {
-      statusString = ((ApiException) error).getStatusCode().getCode().toString();
-    } else {
-      statusString = StatusCode.Code.UNKNOWN.toString();
     }
+    for (Throwable current = error; current != null; current = current.getCause()) {
+      if (current instanceof CancellationException) {
+        return StatusCode.Code.CANCELLED.toString();
+      }
+      if (current instanceof ApiException) {
+        return ((ApiException) current).getStatusCode().getCode().toString();
+      }
+      if (current instanceof SpannerException) {
+        return GrpcStatusCode.of(((SpannerException) current).getErrorCode().getGrpcStatusCode())
+            .getCode()
+            .toString();
+      }
+      io.grpc.Status status = io.grpc.Status.fromThrowable(current);
+      if (status.getCode() != io.grpc.Status.Code.UNKNOWN
+          || current instanceof io.grpc.StatusException
+          || current instanceof io.grpc.StatusRuntimeException) {
+        return status.getCode().toString();
+      }
+    }
+    return StatusCode.Code.UNKNOWN.toString();
+  }
 
-    return statusString;
+  private String updateStatusAndLogIfUnknown(
+      String eventType, @Nullable Throwable originalError, @Nullable Throwable metricsError) {
+    String status = extractStatus(metricsError);
+    if (StatusCode.Code.UNKNOWN.toString().equals(status)) {
+      logIfUnknownStatus(eventType, originalError, metricsError);
+    }
+    return status;
+  }
+
+  private void logIfUnknownStatus(
+      String eventType, @Nullable Throwable originalError, @Nullable Throwable metricsError) {
+    if (!StatusCode.Code.UNKNOWN.toString().equals(extractStatus(metricsError))) {
+      return;
+    }
+    UnknownStatusClassification classification = classifyUnknownStatus(originalError);
+    logger.log(
+        Level.WARNING,
+        "Built-in metrics exported status=UNKNOWN for {0}; classification={1}, method={2},"
+            + " target_endpoint={3}, original_error_chain={4}, metrics_error_chain={5}",
+        new Object[] {
+          eventType,
+          classification.logValue,
+          attributes.get(METHOD_ATTRIBUTE),
+          attributes.get(BuiltInMetricsConstant.TARGET_ENDPOINT_KEY.getKey()),
+          formatThrowableChain(originalError),
+          formatThrowableChain(metricsError)
+        });
+  }
+
+  private static Throwable normalizeErrorForMetrics(@Nullable Throwable error) {
+    if (error == null) {
+      return null;
+    }
+    for (Throwable current = error; current != null; current = current.getCause()) {
+      if (current instanceof CancellationException || current instanceof ApiException) {
+        return current;
+      }
+      io.grpc.Status status = io.grpc.Status.fromThrowable(current);
+      if (status.getCode() != io.grpc.Status.Code.UNKNOWN
+          || current instanceof io.grpc.StatusException
+          || current instanceof io.grpc.StatusRuntimeException) {
+        return ApiExceptionFactory.createException(
+            current, GrpcStatusCode.of(status.getCode()), isRetryableStatus(status.getCode()));
+      }
+    }
+    for (Throwable current = error; current != null; current = current.getCause()) {
+      if (current instanceof SpannerException) {
+        SpannerException spannerException = (SpannerException) current;
+        return ApiExceptionFactory.createException(
+            spannerException,
+            GrpcStatusCode.of(spannerException.getErrorCode().getGrpcStatusCode()),
+            spannerException.isRetryable());
+      }
+    }
+    return error;
+  }
+
+  private static UnknownStatusClassification classifyUnknownStatus(@Nullable Throwable error) {
+    boolean sawRecognizableWrapper = false;
+    for (Throwable current = error; current != null; current = current.getCause()) {
+      if (current instanceof ApiException) {
+        if (((ApiException) current).getStatusCode().getCode() == StatusCode.Code.UNKNOWN) {
+          return UnknownStatusClassification.ACTUAL_GRPC_STATUS_UNKNOWN;
+        }
+        sawRecognizableWrapper = true;
+      } else if (current instanceof io.grpc.StatusException
+          || current instanceof io.grpc.StatusRuntimeException) {
+        io.grpc.Status.Code statusCode = io.grpc.Status.fromThrowable(current).getCode();
+        if (statusCode == io.grpc.Status.Code.UNKNOWN) {
+          return UnknownStatusClassification.ACTUAL_GRPC_STATUS_UNKNOWN;
+        }
+        sawRecognizableWrapper = true;
+      } else if (current instanceof SpannerException) {
+        sawRecognizableWrapper = true;
+      }
+    }
+    if (sawRecognizableWrapper) {
+      return UnknownStatusClassification.WRAPPER_WITHOUT_CONCRETE_TRANSPORT_CODE;
+    }
+    return UnknownStatusClassification.NON_GRPC_INTERNAL_EXCEPTION_NO_STATUS;
+  }
+
+  private static String formatThrowableChain(@Nullable Throwable error) {
+    if (error == null) {
+      return "null";
+    }
+    StringBuilder chain = new StringBuilder();
+    for (Throwable current = error; current != null; current = current.getCause()) {
+      if (chain.length() > 0) {
+        chain.append(" -> ");
+      }
+      chain.append(current.getClass().getName());
+      if (current.getMessage() != null && !current.getMessage().isEmpty()) {
+        chain.append('(').append(current.getMessage()).append(')');
+      }
+    }
+    return chain.toString();
+  }
+
+  private static boolean isRetryableStatus(io.grpc.Status.Code statusCode) {
+    switch (statusCode) {
+      case ABORTED:
+      case DEADLINE_EXCEEDED:
+      case INTERNAL:
+      case RESOURCE_EXHAUSTED:
+      case UNAVAILABLE:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  private enum UnknownStatusClassification {
+    ACTUAL_GRPC_STATUS_UNKNOWN("actual_grpc_status_unknown"),
+    NON_GRPC_INTERNAL_EXCEPTION_NO_STATUS("non_grpc_internal_exception_no_status"),
+    WRAPPER_WITHOUT_CONCRETE_TRANSPORT_CODE("wrapper_without_concrete_transport_code");
+
+    private final String logValue;
+
+    UnknownStatusClassification(String logValue) {
+      this.logValue = logValue;
+    }
   }
 }

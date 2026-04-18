@@ -107,9 +107,23 @@ class HeaderInterceptor implements ClientInterceptor {
           DatabaseName databaseName = extractDatabaseName(headers);
           String key = extractKey(databaseName, method.getFullMethodName());
           String requestId = extractRequestId(headers);
+          String targetEndpoint = RequestIdTargetTracker.get(requestId);
           TagContext tagContext = getTagContext(key, method.getFullMethodName(), databaseName);
           Attributes attributes =
               getMetricAttributes(key, method.getFullMethodName(), databaseName);
+          if (compositeTracer != null) {
+            Map<String, String> earlyBuiltInMetricsAttributes =
+                new HashMap<>(getBuiltInMetricAttributes(key, databaseName));
+            if (requestId != null) {
+              earlyBuiltInMetricsAttributes.put(
+                  BuiltInMetricsConstant.REQUEST_ID_KEY.getKey(), requestId);
+            }
+            if (targetEndpoint != null) {
+              earlyBuiltInMetricsAttributes.put(
+                  BuiltInMetricsConstant.TARGET_ENDPOINT_KEY.getKey(), targetEndpoint);
+            }
+            compositeTracer.addAttributes(earlyBuiltInMetricsAttributes);
+          }
 
           super.start(
               new SimpleForwardingClientCallListener<RespT>(responseListener) {
@@ -137,7 +151,8 @@ class HeaderInterceptor implements ClientInterceptor {
                   recordCustomMetrics(tagContext, attributes, isDirectPathUsed);
                   Map<String, String> builtInMetricsAttributes = new HashMap<>();
                   try {
-                    builtInMetricsAttributes = getBuiltInMetricAttributes(key, databaseName);
+                    builtInMetricsAttributes =
+                        new HashMap<>(getBuiltInMetricAttributes(key, databaseName));
                   } catch (ExecutionException e) {
                     LOGGER.log(
                         LEVEL, "Unable to get built-in metric attributes {}", e.getMessage());
@@ -146,8 +161,10 @@ class HeaderInterceptor implements ClientInterceptor {
                       compositeTracer,
                       builtInMetricsAttributes,
                       requestId,
+                      targetEndpoint,
                       isDirectPathUsed,
                       isAfeEnabled);
+                  RequestIdTargetTracker.remove(requestId);
                   super.onClose(status, trailers);
                 }
               },
@@ -196,10 +213,17 @@ class HeaderInterceptor implements ClientInterceptor {
       CompositeTracer compositeTracer,
       Map<String, String> builtInMetricsAttributes,
       String requestId,
+      String targetEndpoint,
       Boolean isDirectPathUsed,
       Boolean isAfeEnabled) {
     if (compositeTracer != null) {
-      builtInMetricsAttributes.put(BuiltInMetricsConstant.REQUEST_ID_KEY.getKey(), requestId);
+      if (requestId != null) {
+        builtInMetricsAttributes.put(BuiltInMetricsConstant.REQUEST_ID_KEY.getKey(), requestId);
+      }
+      if (targetEndpoint != null) {
+        builtInMetricsAttributes.put(
+            BuiltInMetricsConstant.TARGET_ENDPOINT_KEY.getKey(), targetEndpoint);
+      }
       builtInMetricsAttributes.put(
           BuiltInMetricsConstant.DIRECT_PATH_USED_KEY.getKey(), Boolean.toString(isDirectPathUsed));
       compositeTracer.addAttributes(builtInMetricsAttributes);

@@ -1,0 +1,336 @@
+/**
+ * Copyright (c) 2026 YCSB contributors. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you
+ * may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied. See the License for the specific language governing
+ * permissions and limitations under the License. See accompanying
+ * LICENSE file.
+ */
+package site.ycsb.db.cloudspanner;
+
+import com.google.cloud.opentelemetry.metric.GoogleCloudMetricExporter;
+import com.google.cloud.opentelemetry.metric.MetricConfiguration;
+import com.google.cloud.opentelemetry.trace.TraceConfiguration;
+import com.google.cloud.opentelemetry.trace.TraceExporter;
+import com.google.cloud.spanner.SpannerOptions;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.StatusCode;
+import io.opentelemetry.api.trace.Tracer;
+import io.opentelemetry.context.Scope;
+import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.sdk.OpenTelemetrySdkBuilder;
+import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.metrics.SdkMeterProviderBuilder;
+import io.opentelemetry.sdk.metrics.export.MetricExporter;
+import io.opentelemetry.sdk.metrics.export.PeriodicMetricReader;
+import io.opentelemetry.sdk.resources.Resource;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.export.BatchSpanProcessor;
+import io.opentelemetry.sdk.trace.export.SpanExporter;
+import io.opentelemetry.sdk.trace.samplers.Sampler;
+import java.time.Duration;
+import java.util.Properties;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import site.ycsb.Status;
+
+final class OpenTelemetrySupport {
+
+  private static final Logger LOGGER = Logger.getLogger(OpenTelemetrySupport.class.getName());
+  private static final Scope NOOP_SCOPE = new Scope() {
+    @Override
+    public void close() {}
+  };
+
+  private static final String PROP_PROJECT_ID = "cloudspanner.otel.project";
+  private static final String ENV_PROJECT_ID = "OTEL_PROJECT_ID";
+  private static final String PROP_SERVICE_NAME = "cloudspanner.otel.service";
+  private static final String ENV_SERVICE_NAME = "OTEL_SERVICE_NAME";
+  private static final String PROP_METRIC_PREFIX = "cloudspanner.otel.metric.prefix";
+  private static final String ENV_METRIC_PREFIX = "OTEL_METRIC_PREFIX";
+  private static final String PROP_CLIENT_NAME = "cloudspanner.otel.client.name";
+  private static final String ENV_CLIENT_NAME = "YCSB_OTEL_CLIENT_NAME";
+  private static final String ENV_HOSTNAME = "HOSTNAME";
+  private static final String PROP_METRIC_EXPORT_INTERVAL_SECONDS =
+      "cloudspanner.otel.metric.export.interval.seconds";
+  private static final String ENV_METRIC_EXPORT_INTERVAL_SECONDS =
+      "OTEL_METRIC_EXPORT_INTERVAL_SECONDS";
+  private static final String PROP_EXPORT_BUILTIN_METRICS =
+      "cloudspanner.metrics.export.builtin.to.otel";
+  private static final String ENV_EXPORT_BUILTIN_METRICS =
+      "YCSB_EXPORT_SPANNER_BUILTIN_METRICS_TO_OTEL";
+  private static final String PROP_TRACING_ENABLED = "cloudspanner.tracing.enabled";
+  private static final String ENV_TRACING_ENABLED = "YCSB_ENABLE_OTEL_TRACING";
+  private static final String PROP_USE_OTEL_FOR_SPANNER =
+      "cloudspanner.tracing.spannerotel.enabled";
+  private static final String ENV_USE_OTEL_FOR_SPANNER = "SPANNER_USE_OPENTELEMETRY_TRACING";
+  private static final String PROP_ENABLE_API_TRACING = "cloudspanner.tracing.api.enabled";
+  private static final String ENV_ENABLE_API_TRACING = "SPANNER_ENABLE_API_TRACING";
+  private static final String PROP_ENABLE_EXTENDED_TRACING =
+      "cloudspanner.tracing.extended.enabled";
+  private static final String ENV_ENABLE_EXTENDED_TRACING = "SPANNER_ENABLE_EXTENDED_TRACING";
+  private static final String PROP_ENABLE_END_TO_END_TRACING =
+      "cloudspanner.tracing.endtoend.enabled";
+  private static final String ENV_ENABLE_END_TO_END_TRACING =
+      "SPANNER_ENABLE_END_TO_END_TRACING";
+
+  private static final String DEFAULT_SERVICE_NAME = "ycsb-cloudspanner";
+  private static final String DEFAULT_METRIC_PREFIX = "custom.googleapis.com/ycsb/grpc_gcp";
+  private static final int DEFAULT_EXPORT_INTERVAL_SECONDS = 10;
+
+  private static volatile OpenTelemetrySdk openTelemetrySdk;
+  private static volatile Tracer tracer;
+  private static volatile boolean metricsEnabled;
+  private static volatile boolean tracingEnabled;
+  private static volatile boolean exportBuiltInMetricsEnabled;
+  private static volatile String configuredProjectId = "<disabled>";
+  private static volatile String configuredServiceName = "<disabled>";
+  private static volatile String configuredMetricPrefix = "<disabled>";
+  private static volatile String configuredClientName = "<disabled>";
+
+  private OpenTelemetrySupport() {}
+
+  static void configureSpannerOptions(SpannerOptions.Builder optionsBuilder, Properties properties) {
+    OpenTelemetrySdk sdk = getOrCreateSdk(properties);
+    if (sdk == null) {
+      metricsEnabled = false;
+      tracingEnabled = false;
+      exportBuiltInMetricsEnabled = false;
+      return;
+    }
+
+    optionsBuilder.setOpenTelemetry(sdk);
+    if (exportBuiltInMetricsEnabled) {
+      optionsBuilder.setExportBuiltInMetricsToOpenTelemetry(true);
+      optionsBuilder.setBuiltInMetricsClientName(configuredClientName);
+    }
+    if (tracingEnabled) {
+      if (getBoolean(
+          properties, PROP_USE_OTEL_FOR_SPANNER, ENV_USE_OTEL_FOR_SPANNER, true)) {
+        SpannerOptions.enableOpenTelemetryTraces();
+      }
+      optionsBuilder.setEnableApiTracing(
+          getBoolean(properties, PROP_ENABLE_API_TRACING, ENV_ENABLE_API_TRACING, true));
+      optionsBuilder.setEnableExtendedTracing(
+          getBoolean(
+              properties, PROP_ENABLE_EXTENDED_TRACING, ENV_ENABLE_EXTENDED_TRACING, false));
+      optionsBuilder.setEnableEndToEndTracing(
+          getBoolean(
+              properties,
+              PROP_ENABLE_END_TO_END_TRACING,
+              ENV_ENABLE_END_TO_END_TRACING,
+              false));
+    }
+  }
+
+  static Span startOperationSpan(String operation, String table) {
+    if (!tracingEnabled || tracer == null) {
+      return null;
+    }
+    return tracer
+        .spanBuilder("ycsb." + operation)
+        .setAttribute("db.system", "spanner")
+        .setAttribute("db.operation", operation)
+        .setAttribute("db.name", table)
+        .startSpan();
+  }
+
+  static Scope makeCurrent(Span span) {
+    return span == null ? NOOP_SCOPE : span.makeCurrent();
+  }
+
+  static void finishSpan(Span span, Status status, Throwable error, long startNanos) {
+    if (span == null) {
+      return;
+    }
+    span.setAttribute("ycsb.status", status.getName());
+    span.setAttribute("ycsb.latency_ms", nanosToMillis(System.nanoTime() - startNanos));
+    if (error != null) {
+      span.setStatus(StatusCode.ERROR, error.getMessage());
+      span.recordException(error);
+    } else if (!status.isOk()) {
+      span.setStatus(StatusCode.ERROR, status.getName());
+    }
+    span.end();
+  }
+
+  static boolean isMetricsEnabled() {
+    return metricsEnabled;
+  }
+
+  static boolean isTracingEnabled() {
+    return tracingEnabled;
+  }
+
+  static boolean isExportBuiltInMetricsEnabled() {
+    return exportBuiltInMetricsEnabled;
+  }
+
+  static String getConfiguredProjectId() {
+    return configuredProjectId;
+  }
+
+  static String getConfiguredServiceName() {
+    return configuredServiceName;
+  }
+
+  static String getConfiguredMetricPrefix() {
+    return configuredMetricPrefix;
+  }
+
+  static String getConfiguredClientName() {
+    return configuredClientName;
+  }
+
+  static void shutdown() {
+    OpenTelemetrySdk sdk = openTelemetrySdk;
+    if (sdk != null) {
+      try {
+        sdk.close();
+      } catch (Exception e) {
+        LOGGER.log(Level.FINE, "Error while closing OpenTelemetry SDK", e);
+      }
+    }
+  }
+
+  private static synchronized OpenTelemetrySdk getOrCreateSdk(Properties properties) {
+    if (openTelemetrySdk != null) {
+      return openTelemetrySdk;
+    }
+
+    configuredProjectId = getString(properties, PROP_PROJECT_ID, ENV_PROJECT_ID, "");
+    String configuredService = getString(properties, PROP_SERVICE_NAME, ENV_SERVICE_NAME, "");
+    if (configuredProjectId.isEmpty() || configuredService.isEmpty()) {
+      return null;
+    }
+
+    configuredServiceName = configuredService;
+    configuredMetricPrefix =
+        getString(properties, PROP_METRIC_PREFIX, ENV_METRIC_PREFIX, DEFAULT_METRIC_PREFIX);
+    configuredClientName = resolveClientName(properties, configuredServiceName);
+    metricsEnabled = true;
+    tracingEnabled = getBoolean(properties, PROP_TRACING_ENABLED, ENV_TRACING_ENABLED, true);
+    exportBuiltInMetricsEnabled =
+        getBoolean(
+            properties,
+            PROP_EXPORT_BUILTIN_METRICS,
+            ENV_EXPORT_BUILTIN_METRICS,
+            metricsEnabled);
+
+    Resource resource =
+        Resource.getDefault()
+            .merge(
+                Resource.create(
+                    Attributes.of(
+                        AttributeKey.stringKey("service.name"), configuredServiceName)));
+
+    OpenTelemetrySdkBuilder sdkBuilder = OpenTelemetrySdk.builder();
+
+    int exportIntervalSeconds =
+        getInt(
+            properties,
+            PROP_METRIC_EXPORT_INTERVAL_SECONDS,
+            ENV_METRIC_EXPORT_INTERVAL_SECONDS,
+            DEFAULT_EXPORT_INTERVAL_SECONDS);
+    MetricConfiguration metricConfiguration =
+        MetricConfiguration.builder()
+            .setProjectId(configuredProjectId)
+            .setPrefix(configuredMetricPrefix)
+            .build();
+    MetricExporter metricExporter =
+        GoogleCloudMetricExporter.createWithConfiguration(metricConfiguration);
+    SdkMeterProviderBuilder meterProviderBuilder =
+        SdkMeterProvider.builder()
+            .setResource(resource)
+            .registerMetricReader(
+                PeriodicMetricReader.builder(metricExporter)
+                    .setInterval(Duration.ofSeconds(exportIntervalSeconds))
+                    .build());
+    if (exportBuiltInMetricsEnabled) {
+      SpannerOptions.registerBuiltInMetricViewsForCustomExporter(meterProviderBuilder);
+    }
+    sdkBuilder.setMeterProvider(meterProviderBuilder.build());
+
+    if (tracingEnabled) {
+      TraceConfiguration traceConfiguration =
+          TraceConfiguration.builder().setProjectId(configuredProjectId).build();
+      SpanExporter traceExporter = TraceExporter.createWithConfiguration(traceConfiguration);
+      SdkTracerProvider tracerProvider =
+          SdkTracerProvider.builder()
+              .setResource(resource)
+              .setSampler(Sampler.alwaysOn())
+              .addSpanProcessor(BatchSpanProcessor.builder(traceExporter).build())
+              .build();
+      sdkBuilder.setTracerProvider(tracerProvider);
+    }
+
+    openTelemetrySdk = sdkBuilder.buildAndRegisterGlobal();
+    tracer = openTelemetrySdk.getTracer("ycsb-cloudspanner");
+    LOGGER.log(
+        Level.INFO,
+        "Configured YCSB OTEL support: project={0}, service={1}, metricPrefix={2}, "
+            + "clientName={3}, metricsEnabled={4}, tracingEnabled={5}, exportBuiltInMetrics={6}",
+        new Object[] {
+          configuredProjectId,
+          configuredServiceName,
+          configuredMetricPrefix,
+          configuredClientName,
+          metricsEnabled,
+          tracingEnabled,
+          exportBuiltInMetricsEnabled
+        });
+    return openTelemetrySdk;
+  }
+
+  private static boolean getBoolean(
+      Properties properties, String propertyName, String envName, boolean defaultValue) {
+    return Boolean.parseBoolean(
+        getString(properties, propertyName, envName, String.valueOf(defaultValue)));
+  }
+
+  private static int getInt(
+      Properties properties, String propertyName, String envName, int defaultValue) {
+    return Integer.parseInt(
+        getString(properties, propertyName, envName, String.valueOf(defaultValue)));
+  }
+
+  private static String getString(
+      Properties properties, String propertyName, String envName, String defaultValue) {
+    String value = properties.getProperty(propertyName);
+    if (value != null) {
+      return value;
+    }
+    value = System.getenv(envName);
+    if (value != null) {
+      return value;
+    }
+    return defaultValue;
+  }
+
+  private static String resolveClientName(Properties properties, String serviceName) {
+    String configured =
+        getString(properties, PROP_CLIENT_NAME, ENV_CLIENT_NAME, "");
+    if (!configured.isEmpty()) {
+      return configured;
+    }
+    String hostname = System.getenv(ENV_HOSTNAME);
+    if (hostname != null && !hostname.isEmpty()) {
+      return serviceName + "/" + hostname;
+    }
+    return serviceName;
+  }
+
+  private static double nanosToMillis(long nanos) {
+    return nanos / 1_000_000d;
+  }
+}

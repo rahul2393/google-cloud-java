@@ -39,6 +39,7 @@ class BuiltInMetricsTracerFactory extends MetricsTracerFactory {
   protected BuiltInMetricsRecorder builtInMetricsRecorder;
   private final Map<String, String> attributes;
   private final TraceWrapper traceWrapper;
+  private final boolean allowTargetEndpointAttribute;
 
   /**
    * Pass in a Map of client level attributes which will be added to every single MetricsTracer
@@ -47,11 +48,13 @@ class BuiltInMetricsTracerFactory extends MetricsTracerFactory {
   public BuiltInMetricsTracerFactory(
       BuiltInMetricsRecorder builtInMetricsRecorder,
       Map<String, String> attributes,
-      TraceWrapper traceWrapper) {
+      TraceWrapper traceWrapper,
+      boolean allowTargetEndpointAttribute) {
     super(builtInMetricsRecorder, attributes);
     this.builtInMetricsRecorder = builtInMetricsRecorder;
     this.attributes = ImmutableMap.copyOf(attributes);
     this.traceWrapper = traceWrapper;
+    this.allowTargetEndpointAttribute = allowTargetEndpointAttribute;
   }
 
   @Override
@@ -62,7 +65,8 @@ class BuiltInMetricsTracerFactory extends MetricsTracerFactory {
             MethodName.of(spanName.getClientName(), spanName.getMethodName()),
             builtInMetricsRecorder,
             this.traceWrapper,
-            currentSpan);
+            currentSpan,
+            allowTargetEndpointAttribute);
     metricsTracer.addAttributes(attributes);
     return metricsTracer;
   }

@@ -508,6 +508,28 @@ public class KeyAwareChannelTest {
   }
 
   @Test
+  public void routedRequestRecordsTargetEndpointByRequestId() throws Exception {
+    RequestIdTargetTracker.clear();
+    TestHarness harness = createHarness();
+    seedCache(harness, createLeaderAndReplicaCacheUpdate());
+    XGoogSpannerRequestId requestId = retryRequestId(99L);
+
+    ExecuteSqlRequest request =
+        ExecuteSqlRequest.newBuilder()
+            .setSession(SESSION)
+            .setRoutingHint(RoutingHint.newBuilder().setKey(bytes("b")).build())
+            .build();
+
+    ClientCall<ExecuteSqlRequest, ResultSet> call =
+        harness.channel.newCall(SpannerGrpc.getExecuteSqlMethod(), retryCallOptions(requestId));
+    call.start(new CapturingListener<ResultSet>(), new Metadata());
+    call.sendMessage(request);
+
+    assertThat(RequestIdTargetTracker.get(requestId.getHeaderValue())).isEqualTo("server-a:1234");
+    RequestIdTargetTracker.clear();
+  }
+
+  @Test
   public void resourceExhaustedAffinityEndpointIsAvoidedForSubsequentTransactionRequest()
       throws Exception {
     TestHarness harness = createHarness();

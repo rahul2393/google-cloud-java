@@ -101,7 +101,8 @@ public class OpenTelemetryBuiltInMetricsTracerTest extends AbstractNettyMockServ
             openTelemetry.getTracer(
                 MetricRegistryConstants.INSTRUMENTATION_SCOPE,
                 GaxProperties.getLibraryVersion(getClass())),
-            true));
+            true),
+        false);
   }
 
   @BeforeClass
@@ -125,7 +126,8 @@ public class OpenTelemetryBuiltInMetricsTracerTest extends AbstractNettyMockServ
         new BuiltInMetricsTracerFactory(
             new BuiltInMetricsRecorder(OpenTelemetry.noop(), BuiltInMetricsConstant.METER_NAME),
             attributes,
-            new TraceWrapper(Tracing.getTracer(), OpenTelemetry.noop().getTracer(""), true));
+            new TraceWrapper(Tracing.getTracer(), OpenTelemetry.noop().getTracer(""), true),
+            false);
     // Set a quick polling algorithm to prevent this from slowing down the test unnecessarily.
     builder
         .getDatabaseAdminStubSettingsBuilder()

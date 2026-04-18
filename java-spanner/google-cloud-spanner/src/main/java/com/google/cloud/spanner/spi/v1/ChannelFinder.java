@@ -29,6 +29,7 @@ import com.google.spanner.v1.ReadRequest;
 import com.google.spanner.v1.RoutingHint;
 import com.google.spanner.v1.TransactionOptions;
 import com.google.spanner.v1.TransactionSelector;
+import io.opentelemetry.api.trace.Span;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -109,9 +110,21 @@ public final class ChannelFinder {
 
   private static final class PendingCacheUpdate {
     private final CacheUpdate update;
+    private final long queuedAtNanos;
+    @Nullable private final String targetEndpoint;
+    @Nullable private final String method;
+    @Nullable private final Span span;
 
-    private PendingCacheUpdate(CacheUpdate update) {
+    private PendingCacheUpdate(
+        CacheUpdate update,
+        @Nullable String targetEndpoint,
+        @Nullable String method,
+        @Nullable Span span) {
       this.update = update;
+      this.queuedAtNanos = System.nanoTime();
+      this.targetEndpoint = targetEndpoint;
+      this.method = method;
+      this.span = span;
     }
   }
 
@@ -139,10 +152,18 @@ public final class ChannelFinder {
   }
 
   public void updateAsync(CacheUpdate update) {
+    updateAsync(update, null, null, null);
+  }
+
+  public void updateAsync(
+      CacheUpdate update,
+      @Nullable String targetEndpoint,
+      @Nullable String method,
+      @Nullable Span span) {
     if (!shouldProcessUpdate(update)) {
       return;
     }
-    pendingUpdates.add(new PendingCacheUpdate(update));
+    pendingUpdates.add(new PendingCacheUpdate(update, targetEndpoint, method, span));
     if (drainScheduled.compareAndSet(false, true)) {
       java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
       drainingLatch = latch;
@@ -184,7 +205,15 @@ public final class ChannelFinder {
     Set<String> currentAddresses;
     synchronized (updateLock) {
       for (PendingCacheUpdate pendingUpdate : batch) {
+        long processingStartedAtNanos = System.nanoTime();
         applyUpdateLocked(pendingUpdate.update);
+        LocationAwareTelemetry.recordCacheUpdateProcessed(
+            pendingUpdate.targetEndpoint,
+            pendingUpdate.method,
+            pendingUpdate.queuedAtNanos,
+            processingStartedAtNanos,
+            System.nanoTime(),
+            pendingUpdate.span);
       }
       currentAddresses = snapshotActiveAddressesLocked();
     }

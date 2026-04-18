@@ -132,6 +132,20 @@ final class EndpointOverloadCooldownTracker {
         });
   }
 
+  int activeCooldownCount() {
+    Instant now = clock.instant();
+    int count = 0;
+    for (java.util.Map.Entry<String, CooldownState> entry : entries.entrySet()) {
+      CooldownState state = entry.getValue();
+      if (state.cooldownUntil.isAfter(now)) {
+        count++;
+      } else if (Duration.between(state.lastFailureAt, now).compareTo(resetAfter) >= 0) {
+        entries.remove(entry.getKey(), state);
+      }
+    }
+    return count;
+  }
+
   private Duration cooldownForFailures(int failures) {
     Duration cooldown = initialCooldown;
     for (int i = 1; i < failures; i++) {

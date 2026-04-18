@@ -142,11 +142,19 @@ final class BuiltInMetricsProvider {
       @Nullable Credentials credentials,
       @Nullable String monitoringHost,
       String universeDomain) {
+    OpenTelemetry openTelemetry =
+        this.getOrCreateOpenTelemetry(projectId, credentials, monitoringHost, universeDomain);
+    if (!(openTelemetry instanceof OpenTelemetrySdk)) {
+      return;
+    }
+    enableGrpcMetrics(channelProviderBuilder, (OpenTelemetrySdk) openTelemetry);
+  }
+
+  void enableGrpcMetrics(
+      InstantiatingGrpcChannelProvider.Builder channelProviderBuilder, OpenTelemetrySdk sdk) {
     GrpcOpenTelemetry grpcOpenTelemetry =
         GrpcOpenTelemetry.newBuilder()
-            .sdk(
-                this.getOrCreateOpenTelemetry(
-                    projectId, credentials, monitoringHost, universeDomain))
+            .sdk(sdk)
             .enableMetrics(BuiltInMetricsConstant.GRPC_METRICS_TO_ENABLE)
             // Disable gRPCs default metrics as they are not needed for Spanner.
             .disableMetrics(BuiltInMetricsConstant.GRPC_METRICS_ENABLED_BY_DEFAULT)

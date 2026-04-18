@@ -34,6 +34,8 @@ import com.google.cloud.spanner.Statement;
 import com.google.cloud.spanner.Struct;
 import com.google.cloud.spanner.StructReader;
 import com.google.cloud.spanner.TimestampBound;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.context.Scope;
 import io.grpc.ManagedChannelBuilder;
 import site.ycsb.ByteIterator;
 import site.ycsb.Client;
@@ -215,6 +217,7 @@ public class CloudSpannerClient extends DB {
     if (project != null) {
       optionsBuilder.setProjectId(project);
     }
+    OpenTelemetrySupport.configureSpannerOptions(optionsBuilder, properties);
     if (dynamicChannelPoolEnabled) {
       GcpChannelPoolOptions defaultChannelPoolOptions =
           SpannerOptions.createDefaultDynamicChannelPoolOptions();
@@ -295,6 +298,7 @@ public class CloudSpannerClient extends DB {
         @Override
         public void run() {
           spanner.close();
+          OpenTelemetrySupport.shutdown();
         }
       });
     return spanner;
@@ -368,12 +372,27 @@ public class CloudSpannerClient extends DB {
               properties.getProperty(
                       CloudSpannerProperties.DYNAMIC_CHANNEL_POOL_CONCURRENT_STREAMS_LOW_WATERMARK,
                       "<default>"))
+          .append("\nOTEL metrics enabled: ")
+          .append(OpenTelemetrySupport.isMetricsEnabled())
+          .append("\nOTEL tracing enabled: ")
+          .append(OpenTelemetrySupport.isTracingEnabled())
+          .append("\nOTEL project: ")
+          .append(OpenTelemetrySupport.getConfiguredProjectId())
+          .append("\nOTEL service: ")
+          .append(OpenTelemetrySupport.getConfiguredServiceName())
+          .append("\nOTEL metric prefix: ")
+          .append(OpenTelemetrySupport.getConfiguredMetricPrefix())
+          .append("\nOTEL client name: ")
+          .append(OpenTelemetrySupport.getConfiguredClientName())
+          .append("\nExport Spanner built-in metrics to OTEL: ")
+          .append(OpenTelemetrySupport.isExportBuiltInMetricsEnabled())
           .toString());
     }
   }
 
   private Status readUsingQuery(
       String table, String key, Set<String> fields, Map<String, ByteIterator> result) {
+    annotateReadSpan(Span.current(), key, true);
     Statement query;
     Iterable<String> columns = fields == null ? STANDARD_FIELDS : fields;
     if (fields == null || fields.size() == fieldCount) {
@@ -405,18 +424,41 @@ public class CloudSpannerClient extends DB {
   @Override
   public Status read(
       String table, String key, Set<String> fields, Map<String, ByteIterator> result) {
-    if (queriesForReads) {
-      return readUsingQuery(table, key, fields, result);
+    Span span = OpenTelemetrySupport.startOperationSpan("read", table);
+    long startNanos = System.nanoTime();
+    Status status = Status.ERROR;
+    Throwable error = null;
+    try (Scope scope = OpenTelemetrySupport.makeCurrent(span)) {
+      annotateReadSpan(span, key, queriesForReads);
+      if (queriesForReads) {
+        status = readUsingQuery(table, key, fields, result);
+        return status;
+      }
+      Iterable<String> columns = fields == null ? STANDARD_FIELDS : fields;
+      try {
+        Struct row = dbClient.singleUse(timestampBound).readRow(table, Key.of(key), columns);
+        decodeStruct(columns, row, result);
+        status = Status.OK;
+      } catch (Exception e) {
+        error = e;
+        LOGGER.log(Level.INFO, "read()", e);
+        status = Status.ERROR;
+      }
+      return status;
+    } finally {
+      OpenTelemetrySupport.finishSpan(span, status, error, startNanos);
     }
-    Iterable<String> columns = fields == null ? STANDARD_FIELDS : fields;
-    try {
-      Struct row = dbClient.singleUse(timestampBound).readRow(table, Key.of(key), columns);
-      decodeStruct(columns, row, result);
-      return Status.OK;
-    } catch (Exception e) {
-      LOGGER.log(Level.INFO, "read()", e);
-      return Status.ERROR;
+  }
+
+  private void annotateReadSpan(Span span, String key, boolean queryMode) {
+    if (span == null) {
+      return;
     }
+    span.setAttribute("ycsb.key", key);
+    span.setAttribute("ycsb.read.mode", queryMode ? "query" : "read");
+    span.setAttribute("ycsb.read.consistency", timestampBound.getMode().name().toLowerCase());
+    span.setAttribute(
+        "ycsb.read.strong", timestampBound.getMode() == TimestampBound.Mode.STRONG);
   }
 
   private Status scanUsingQuery(
@@ -454,66 +496,103 @@ public class CloudSpannerClient extends DB {
   public Status scan(
       String table, String startKey, int recordCount, Set<String> fields,
       Vector<HashMap<String, ByteIterator>> result) {
-    if (queriesForReads) {
-      return scanUsingQuery(table, startKey, recordCount, fields, result);
-    }
-    Iterable<String> columns = fields == null ? STANDARD_FIELDS : fields;
-    KeySet keySet =
-        KeySet.newBuilder().addRange(KeyRange.closedClosed(Key.of(startKey), Key.of())).build();
-    try (ResultSet resultSet = dbClient.singleUse(timestampBound)
-                                       .read(table, keySet, columns, Options.limit(recordCount))) {
-      while (resultSet.next()) {
-        HashMap<String, ByteIterator> row = new HashMap<>();
-        decodeStruct(columns, resultSet, row);
-        result.add(row);
+    Span span = OpenTelemetrySupport.startOperationSpan("scan", table);
+    long startNanos = System.nanoTime();
+    Status status = Status.ERROR;
+    Throwable error = null;
+    try (Scope scope = OpenTelemetrySupport.makeCurrent(span)) {
+      if (queriesForReads) {
+        status = scanUsingQuery(table, startKey, recordCount, fields, result);
+        return status;
       }
-      return Status.OK;
-    } catch (Exception e) {
-      LOGGER.log(Level.INFO, "scan()", e);
-      return Status.ERROR;
+      Iterable<String> columns = fields == null ? STANDARD_FIELDS : fields;
+      KeySet keySet =
+          KeySet.newBuilder().addRange(KeyRange.closedClosed(Key.of(startKey), Key.of())).build();
+      try (ResultSet resultSet =
+          dbClient
+              .singleUse(timestampBound)
+              .read(table, keySet, columns, Options.limit(recordCount))) {
+        while (resultSet.next()) {
+          HashMap<String, ByteIterator> row = new HashMap<>();
+          decodeStruct(columns, resultSet, row);
+          result.add(row);
+        }
+        status = Status.OK;
+      } catch (Exception e) {
+        error = e;
+        LOGGER.log(Level.INFO, "scan()", e);
+        status = Status.ERROR;
+      }
+      return status;
+    } finally {
+      OpenTelemetrySupport.finishSpan(span, status, error, startNanos);
     }
   }
 
   @Override
   public Status update(String table, String key, Map<String, ByteIterator> values) {
-    Mutation.WriteBuilder m = Mutation.newInsertOrUpdateBuilder(table);
-    m.set(PRIMARY_KEY_COLUMN).to(key);
-    for (Map.Entry<String, ByteIterator> e : values.entrySet()) {
-      m.set(e.getKey()).to(e.getValue().toString());
-    }
-    try {
-      dbClient.writeAtLeastOnce(Arrays.asList(m.build()));
-    } catch (Exception e) {
-      LOGGER.log(Level.INFO, "update()", e);
-      return Status.ERROR;
-    }
-    return Status.OK;
-  }
-
-  @Override
-  public Status insert(String table, String key, Map<String, ByteIterator> values) {
-    if (bufferedMutations.size() < batchInserts) {
+    Span span = OpenTelemetrySupport.startOperationSpan("update", table);
+    long startNanos = System.nanoTime();
+    Status status = Status.ERROR;
+    Throwable error = null;
+    try (Scope scope = OpenTelemetrySupport.makeCurrent(span)) {
       Mutation.WriteBuilder m = Mutation.newInsertOrUpdateBuilder(table);
       m.set(PRIMARY_KEY_COLUMN).to(key);
       for (Map.Entry<String, ByteIterator> e : values.entrySet()) {
         m.set(e.getKey()).to(e.getValue().toString());
       }
-      bufferedMutations.add(m.build());
-    } else {
-      LOGGER.log(Level.INFO, "Limit of cached mutations reached. The given mutation with key " + key +
-          " is ignored. Is this a retry?");
+      try {
+        dbClient.writeAtLeastOnce(Arrays.asList(m.build()));
+        status = Status.OK;
+      } catch (Exception e) {
+        error = e;
+        LOGGER.log(Level.INFO, "update()", e);
+        status = Status.ERROR;
+      }
+      return status;
+    } finally {
+      OpenTelemetrySupport.finishSpan(span, status, error, startNanos);
     }
-    if (bufferedMutations.size() < batchInserts) {
-      return Status.BATCHED_OK;
+  }
+
+  @Override
+  public Status insert(String table, String key, Map<String, ByteIterator> values) {
+    Span span = OpenTelemetrySupport.startOperationSpan("insert", table);
+    long startNanos = System.nanoTime();
+    Status status = Status.ERROR;
+    Throwable error = null;
+    try (Scope scope = OpenTelemetrySupport.makeCurrent(span)) {
+      if (bufferedMutations.size() < batchInserts) {
+        Mutation.WriteBuilder m = Mutation.newInsertOrUpdateBuilder(table);
+        m.set(PRIMARY_KEY_COLUMN).to(key);
+        for (Map.Entry<String, ByteIterator> e : values.entrySet()) {
+          m.set(e.getKey()).to(e.getValue().toString());
+        }
+        bufferedMutations.add(m.build());
+      } else {
+        LOGGER.log(
+            Level.INFO,
+            "Limit of cached mutations reached. The given mutation with key "
+                + key
+                + " is ignored. Is this a retry?");
+      }
+      if (bufferedMutations.size() < batchInserts) {
+        status = Status.BATCHED_OK;
+        return status;
+      }
+      try {
+        dbClient.writeAtLeastOnce(bufferedMutations);
+        bufferedMutations.clear();
+        status = Status.OK;
+      } catch (Exception e) {
+        error = e;
+        LOGGER.log(Level.INFO, "insert()", e);
+        status = Status.ERROR;
+      }
+      return status;
+    } finally {
+      OpenTelemetrySupport.finishSpan(span, status, error, startNanos);
     }
-    try {
-      dbClient.writeAtLeastOnce(bufferedMutations);
-      bufferedMutations.clear();
-    } catch (Exception e) {
-      LOGGER.log(Level.INFO, "insert()", e);
-      return Status.ERROR;
-    }
-    return Status.OK;
   }
 
   @Override
@@ -530,13 +609,23 @@ public class CloudSpannerClient extends DB {
 
   @Override
   public Status delete(String table, String key) {
-    try {
-      dbClient.writeAtLeastOnce(Arrays.asList(Mutation.delete(table, Key.of(key))));
-    } catch (Exception e) {
-      LOGGER.log(Level.INFO, "delete()", e);
-      return Status.ERROR;
+    Span span = OpenTelemetrySupport.startOperationSpan("delete", table);
+    long startNanos = System.nanoTime();
+    Status status = Status.ERROR;
+    Throwable error = null;
+    try (Scope scope = OpenTelemetrySupport.makeCurrent(span)) {
+      try {
+        dbClient.writeAtLeastOnce(Arrays.asList(Mutation.delete(table, Key.of(key))));
+        status = Status.OK;
+      } catch (Exception e) {
+        error = e;
+        LOGGER.log(Level.INFO, "delete()", e);
+        status = Status.ERROR;
+      }
+      return status;
+    } finally {
+      OpenTelemetrySupport.finishSpan(span, status, error, startNanos);
     }
-    return Status.OK;
   }
 
   private static void decodeStruct(

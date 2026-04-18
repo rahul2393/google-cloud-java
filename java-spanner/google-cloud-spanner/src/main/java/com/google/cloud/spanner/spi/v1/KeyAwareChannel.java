@@ -37,6 +37,7 @@ import com.google.spanner.v1.Transaction;
 import com.google.spanner.v1.TransactionSelector;
 import io.grpc.CallOptions;
 import io.grpc.ClientCall;
+import io.grpc.ClientStreamTracer;
 import io.grpc.ForwardingClientCall;
 import io.grpc.ForwardingClientCallListener.SimpleForwardingClientCallListener;
 import io.grpc.ManagedChannel;
@@ -47,6 +48,7 @@ import io.opentelemetry.api.trace.Span;
 import java.io.IOException;
 import java.lang.ref.ReferenceQueue;
 import java.lang.ref.SoftReference;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
@@ -104,6 +106,7 @@ final class KeyAwareChannel extends ManagedChannel {
           .expireAfterWrite(EXCLUDED_LOGICAL_REQUEST_TTL_MINUTES, TimeUnit.MINUTES)
           .build();
   private final EndpointOverloadCooldownTracker endpointOverloadCooldowns;
+  private final LocationAwareTelemetry.EndpointStateProvider endpointStateProvider;
 
   private KeyAwareChannel(
       InstantiatingGrpcChannelProvider channelProvider,
@@ -138,6 +141,8 @@ final class KeyAwareChannel extends ManagedChannel {
     this.lifecycleManager =
         (endpointCacheFactory == null) ? new EndpointLifecycleManager(endpointCache) : null;
     this.endpointOverloadCooldowns = endpointOverloadCooldowns;
+    this.endpointStateProvider = this::snapshotEndpointStateCounts;
+    LocationAwareTelemetry.registerEndpointStateProvider(endpointStateProvider);
   }
 
   static KeyAwareChannel create(
@@ -243,6 +248,7 @@ final class KeyAwareChannel extends ManagedChannel {
   @Override
   public ManagedChannel shutdown() {
     cleanupStaleChannelFinders();
+    LocationAwareTelemetry.unregisterEndpointStateProvider(endpointStateProvider);
     if (lifecycleManager != null) {
       lifecycleManager.shutdown();
     }
@@ -253,6 +259,7 @@ final class KeyAwareChannel extends ManagedChannel {
   @Override
   public ManagedChannel shutdownNow() {
     cleanupStaleChannelFinders();
+    LocationAwareTelemetry.unregisterEndpointStateProvider(endpointStateProvider);
     if (lifecycleManager != null) {
       lifecycleManager.shutdown();
     }
@@ -297,6 +304,11 @@ final class KeyAwareChannel extends ManagedChannel {
         || BEGIN_TRANSACTION_METHOD.equals(method)
         || COMMIT_METHOD.equals(method)
         || ROLLBACK_METHOD.equals(method);
+  }
+
+  private static boolean isStreamingMethod(MethodDescriptor<?, ?> methodDescriptor) {
+    return STREAMING_READ_METHOD.equals(methodDescriptor.getFullMethodName())
+        || STREAMING_SQL_METHOD.equals(methodDescriptor.getFullMethodName());
   }
 
   @Nullable
@@ -482,15 +494,18 @@ final class KeyAwareChannel extends ManagedChannel {
       MethodDescriptor<?, ?> methodDescriptor,
       String target,
       boolean usedDefaultEndpoint,
-      boolean hasChannelFinder) {
+      boolean hasChannelFinder,
+      long routeSelectionNanos) {
     Span span = Span.current();
     if (!span.getSpanContext().isValid()) {
       return;
     }
+    double routeSelectionMs = nanosToMillis(routeSelectionNanos);
     span.setAttribute("spanner.target", target);
     span.setAttribute("spanner.route.used_default_endpoint", usedDefaultEndpoint);
     span.setAttribute("spanner.route.has_channel_finder", hasChannelFinder);
     span.setAttribute("spanner.route.method", methodDescriptor.getFullMethodName());
+    span.setAttribute("spanner.route.selection_ms", routeSelectionMs);
     span.addEvent(
         "spanner.route.selected",
         Attributes.builder()
@@ -498,7 +513,24 @@ final class KeyAwareChannel extends ManagedChannel {
             .put("spanner.route.used_default_endpoint", usedDefaultEndpoint)
             .put("spanner.route.has_channel_finder", hasChannelFinder)
             .put("spanner.route.method", methodDescriptor.getFullMethodName())
+            .put("spanner.route.selection_ms", routeSelectionMs)
             .build());
+  }
+
+  private static double nanosToMillis(long nanos) {
+    return nanos / 1_000_000d;
+  }
+
+  private Map<String, Long> snapshotEndpointStateCounts() {
+    Map<String, Long> counts = new HashMap<>();
+    if (lifecycleManager != null) {
+      counts.putAll(lifecycleManager.snapshotEndpointStateCounts());
+    }
+    int cooldownCount = endpointOverloadCooldowns.activeCooldownCount();
+    if (cooldownCount > 0) {
+      counts.merge("cooldown", (long) cooldownCount, Long::sum);
+    }
+    return counts;
   }
 
   static final class KeyAwareClientCall<RequestT, ResponseT>
@@ -573,6 +605,7 @@ final class KeyAwareChannel extends ManagedChannel {
         if (this.cancelledStatus != null) {
           return;
         }
+        long routeSelectionStartedAtNanos = System.nanoTime();
         if (responseListener == null || headers == null) {
           throw new IllegalStateException("start must be called before sendMessage");
         }
@@ -659,12 +692,28 @@ final class KeyAwareChannel extends ManagedChannel {
         // Record real traffic for idle eviction tracking.
         parentChannel.onRequestRouted(endpoint);
 
+        XGoogSpannerRequestId requestId = callOptions.getOption(REQUEST_ID_CALL_OPTIONS_KEY);
+        if (requestId != null) {
+          RequestIdTargetTracker.record(requestId.getHeaderValue(), endpoint.getAddress());
+        }
+        long routeSelectionCompletedAtNanos = System.nanoTime();
         recordRouteSelectionTrace(
             methodDescriptor,
             endpoint.getAddress(),
             parentChannel.defaultEndpointAddress.equals(endpoint.getAddress()),
-            finder != null);
-        delegate = endpoint.getChannel().newCall(methodDescriptor, callOptions);
+            finder != null,
+            routeSelectionCompletedAtNanos - routeSelectionStartedAtNanos);
+        CallOptions effectiveCallOptions = callOptions;
+        if (isStreamingMethod(methodDescriptor)) {
+          effectiveCallOptions =
+              effectiveCallOptions.withStreamTracerFactory(
+                  new LocationAwareClientStreamTracerFactory(
+                      Span.current(),
+                      methodDescriptor.getFullMethodName(),
+                      endpoint.getAddress(),
+                      routeSelectionCompletedAtNanos - routeSelectionStartedAtNanos));
+        }
+        delegate = endpoint.getChannel().newCall(methodDescriptor, effectiveCallOptions);
         if (pendingMessageCompression != null) {
           delegate.setMessageCompression(pendingMessageCompression);
           pendingMessageCompression = null;
@@ -856,6 +905,17 @@ final class KeyAwareChannel extends ManagedChannel {
       }
       return new RoutingDecision(finder, endpoint);
     }
+
+    private void enqueueCacheUpdate(com.google.spanner.v1.CacheUpdate cacheUpdate) {
+      if (channelFinder == null) {
+        return;
+      }
+      String targetEndpoint = selectedEndpoint == null ? null : selectedEndpoint.getAddress();
+      String method = methodDescriptor.getFullMethodName();
+      Span span = Span.current();
+      LocationAwareTelemetry.recordCacheUpdateReceived(targetEndpoint, method);
+      channelFinder.updateAsync(cacheUpdate, targetEndpoint, method, span);
+    }
   }
 
   private static final class RoutingDecision {
@@ -865,6 +925,46 @@ final class KeyAwareChannel extends ManagedChannel {
     private RoutingDecision(@Nullable ChannelFinder finder, @Nullable ChannelEndpoint endpoint) {
       this.finder = finder;
       this.endpoint = endpoint;
+    }
+  }
+
+  private static final class LocationAwareClientStreamTracerFactory
+      extends ClientStreamTracer.Factory {
+    private final Span span;
+    private final String method;
+    private final String targetEndpoint;
+    private final double routeSelectionMs;
+
+    private LocationAwareClientStreamTracerFactory(
+        Span span, String method, String targetEndpoint, long routeSelectionNanos) {
+      this.span = span;
+      this.method = method;
+      this.targetEndpoint = targetEndpoint;
+      this.routeSelectionMs = nanosToMillis(routeSelectionNanos);
+    }
+
+    @Override
+    public ClientStreamTracer newClientStreamTracer(
+        ClientStreamTracer.StreamInfo info, Metadata headers) {
+      long streamCreationStartedAtNanos = System.nanoTime();
+      return new ClientStreamTracer() {
+        @Override
+        public void streamCreated(io.grpc.Attributes transportAttrs, Metadata metadata) {
+          if (!span.getSpanContext().isValid()) {
+            return;
+          }
+          span.addEvent(
+              "spanner.stream.created",
+              Attributes.builder()
+                  .put("spanner.route.method", method)
+                  .put("spanner.target", targetEndpoint)
+                  .put(
+                      "spanner.stream.creation_ms",
+                      nanosToMillis(System.nanoTime() - streamCreationStartedAtNanos))
+                  .put("spanner.route.selection_ms", routeSelectionMs)
+                  .build());
+        }
+      };
     }
   }
 
@@ -884,25 +984,25 @@ final class KeyAwareChannel extends ManagedChannel {
       if (message instanceof PartialResultSet) {
         PartialResultSet response = (PartialResultSet) message;
         if (response.hasCacheUpdate() && call.channelFinder != null) {
-          call.channelFinder.updateAsync(response.getCacheUpdate());
+          call.enqueueCacheUpdate(response.getCacheUpdate());
         }
         transactionId = transactionIdFromMetadata(response);
       } else if (message instanceof ResultSet) {
         ResultSet response = (ResultSet) message;
         if (response.hasCacheUpdate() && call.channelFinder != null) {
-          call.channelFinder.updateAsync(response.getCacheUpdate());
+          call.enqueueCacheUpdate(response.getCacheUpdate());
         }
         transactionId = transactionIdFromMetadata(response);
       } else if (message instanceof Transaction) {
         Transaction response = (Transaction) message;
         if (response.hasCacheUpdate() && call.channelFinder != null) {
-          call.channelFinder.updateAsync(response.getCacheUpdate());
+          call.enqueueCacheUpdate(response.getCacheUpdate());
         }
         transactionId = transactionIdFromTransaction(response);
       } else if (message instanceof CommitResponse) {
         CommitResponse response = (CommitResponse) message;
         if (response.hasCacheUpdate() && call.channelFinder != null) {
-          call.channelFinder.updateAsync(response.getCacheUpdate());
+          call.enqueueCacheUpdate(response.getCacheUpdate());
         }
       }
       if (transactionId != null) {

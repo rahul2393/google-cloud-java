@@ -35,6 +35,7 @@ import javax.annotation.Nullable;
 class BuiltInMetricsTracer extends MetricsTracer implements ApiTracer {
 
   private final BuiltInMetricsRecorder builtInOpenTelemetryMetricsRecorder;
+  private final boolean allowTargetEndpointAttribute;
   // These are RPC specific attributes and pertain to a specific API Trace
   private final Map<String, String> attributes = new HashMap<>();
   private Float gfeLatency = null;
@@ -48,9 +49,11 @@ class BuiltInMetricsTracer extends MetricsTracer implements ApiTracer {
       MethodName methodName,
       BuiltInMetricsRecorder builtInOpenTelemetryMetricsRecorder,
       TraceWrapper traceWrapper,
-      ISpan currentSpan) {
+      ISpan currentSpan,
+      boolean allowTargetEndpointAttribute) {
     super(methodName, builtInOpenTelemetryMetricsRecorder);
     this.builtInOpenTelemetryMetricsRecorder = builtInOpenTelemetryMetricsRecorder;
+    this.allowTargetEndpointAttribute = allowTargetEndpointAttribute;
     this.attributes.put(METHOD_ATTRIBUTE, methodName.toString());
     this.traceWrapper = traceWrapper;
     this.currentSpan = currentSpan;
@@ -146,14 +149,32 @@ class BuiltInMetricsTracer extends MetricsTracer implements ApiTracer {
 
   @Override
   public void addAttributes(Map<String, String> attributes) {
-    super.addAttributes(attributes);
-    this.attributes.putAll(attributes);
+    Map<String, String> filteredAttributes = filterAttributes(attributes);
+    super.addAttributes(filteredAttributes);
+    this.attributes.putAll(filteredAttributes);
   }
 
   @Override
   public void addAttributes(String key, String value) {
+    if (!shouldAcceptAttribute(key)) {
+      return;
+    }
     super.addAttributes(key, value);
     this.attributes.put(key, value);
+  }
+
+  private Map<String, String> filterAttributes(Map<String, String> attributes) {
+    if (allowTargetEndpointAttribute) {
+      return attributes;
+    }
+    Map<String, String> filteredAttributes = new HashMap<>(attributes);
+    filteredAttributes.remove(BuiltInMetricsConstant.TARGET_ENDPOINT_KEY.getKey());
+    return filteredAttributes;
+  }
+
+  private boolean shouldAcceptAttribute(String key) {
+    return allowTargetEndpointAttribute
+        || !BuiltInMetricsConstant.TARGET_ENDPOINT_KEY.getKey().equals(key);
   }
 
   private static String extractStatus(@Nullable Throwable error) {

@@ -533,13 +533,8 @@ public class ReplicaSelectionMockServerTest {
   @Test
   public void testStaleSingleUseReadBootstrapsScoresAndConvergesToLowerLatencyReplica()
       throws Exception {
-    SpannerOptions options =
-        SpannerOptions.newBuilder()
-            .usePlainText()
-            .setExperimentalHost("localhost:" + servers.get(0).port)
-            .setProjectId("fake-project")
-            .setChannelEndpointCacheFactory(null)
-            .build();
+    InMemoryMetricReader metricReader = InMemoryMetricReader.create();
+    SpannerOptions options = createSpannerOptionsWithCustomExporter(metricReader);
 
     RecipeList.Builder recipeListBuilder = RecipeList.newBuilder();
     try {
@@ -639,11 +634,18 @@ public class ReplicaSelectionMockServerTest {
       clearServerRequests();
       boolean sampledServer0 = false;
       boolean sampledServer1 = false;
+      boolean foundLatencyScoreDecision = false;
       Stopwatch watch = Stopwatch.createStarted();
       int attempt = 0;
       long operationUid = 0L;
+      AttributeKey<String> decisionKey = AttributeKey.stringKey("decision");
+      AttributeKey<String> reasonKey = AttributeKey.stringKey("reason");
+      AttributeKey<String> selectionReasonKey = AttributeKey.stringKey("selection_reason");
+      AttributeKey<String> endpointKey = AttributeKey.stringKey("target_endpoint");
+      AttributeKey<Long> operationUidKey = AttributeKey.longKey("operation_uid");
 
-      while (watch.elapsed(TimeUnit.SECONDS) < 10 && (!sampledServer0 || !sampledServer1)) {
+      while (watch.elapsed(TimeUnit.SECONDS) < 10
+          && (!sampledServer0 || !sampledServer1 || !foundLatencyScoreDecision)) {
         attempt++;
         String key = "bootstrap-key-" + attempt;
         try (com.google.cloud.spanner.ResultSet rs =
@@ -672,11 +674,34 @@ public class ReplicaSelectionMockServerTest {
             hasReadRequestForKey(servers.get(0).mockSpanner, key) || sampledServer0;
         sampledServer1 =
             hasReadRequestForKey(servers.get(1).mockSpanner, key) || sampledServer1;
+        if (operationUid > 0L) {
+          final long routedOperationUid = operationUid;
+          MetricData routingDecisionMetric =
+              getMetricData(metricReader, "location_aware.routing_decision_count");
+          assertNotNull(routingDecisionMetric);
+          foundLatencyScoreDecision =
+              routingDecisionMetric.getLongSumData().getPoints().stream()
+                  .anyMatch(
+                      point ->
+                          point.getValue() > 0
+                              && "routed_replica".equals(point.getAttributes().get(decisionKey))
+                              && "selected".equals(point.getAttributes().get(reasonKey))
+                              && "latency_score".equals(
+                                  point.getAttributes().get(selectionReasonKey))
+                              && Long.valueOf(routedOperationUid)
+                                  .equals(point.getAttributes().get(operationUidKey))
+                              && server1Address.equals(
+                                  EndpointLatencyRegistry.normalizeAddress(
+                                      point.getAttributes().get(endpointKey))));
+        }
       }
 
       assertTrue("Expected bootstrap exploration to sample server0", sampledServer0);
       assertTrue("Expected bootstrap exploration to sample server1", sampledServer1);
       assertTrue("Expected stale reads to reuse the same operation_uid", operationUid > 0L);
+      assertTrue(
+          "Expected real stale reads to produce a latency_score routing decision",
+          foundLatencyScoreDecision);
 
       clearServerRequests();
       boolean routedToLowerLatencyReplica = false;

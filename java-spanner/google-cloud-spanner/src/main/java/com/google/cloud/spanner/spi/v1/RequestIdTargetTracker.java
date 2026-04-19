@@ -16,6 +16,7 @@
 
 package com.google.cloud.spanner.spi.v1;
 
+import com.google.cloud.spanner.XGoogSpannerRequestId;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
@@ -33,33 +34,45 @@ final class RequestIdTargetTracker {
   private RequestIdTargetTracker() {}
 
   static void record(String requestId, String targetEndpoint, long operationUid) {
-    if (requestId == null
-        || requestId.isEmpty()
-        || targetEndpoint == null
-        || targetEndpoint.isEmpty()) {
+    String trackingKey = normalizeRequestKey(requestId);
+    if (trackingKey == null || targetEndpoint == null || targetEndpoint.isEmpty()) {
       return;
     }
-    TARGETS.put(requestId, new RoutingTarget(targetEndpoint, operationUid));
+    TARGETS.put(trackingKey, new RoutingTarget(targetEndpoint, operationUid));
   }
 
   @Nullable
   static RoutingTarget get(String requestId) {
-    if (requestId == null || requestId.isEmpty()) {
+    String trackingKey = normalizeRequestKey(requestId);
+    if (trackingKey == null) {
       return null;
     }
-    return TARGETS.getIfPresent(requestId);
+    return TARGETS.getIfPresent(trackingKey);
   }
 
   static void remove(String requestId) {
-    if (requestId == null || requestId.isEmpty()) {
+    String trackingKey = normalizeRequestKey(requestId);
+    if (trackingKey == null) {
       return;
     }
-    TARGETS.invalidate(requestId);
+    TARGETS.invalidate(trackingKey);
   }
 
   @VisibleForTesting
   static void clear() {
     TARGETS.invalidateAll();
+  }
+
+  @VisibleForTesting
+  static String normalizeRequestKey(String requestId) {
+    if (requestId == null || requestId.isEmpty()) {
+      return null;
+    }
+    try {
+      return XGoogSpannerRequestId.of(requestId).getLogicalRequestKey();
+    } catch (IllegalStateException e) {
+      return requestId;
+    }
   }
 
   static final class RoutingTarget {

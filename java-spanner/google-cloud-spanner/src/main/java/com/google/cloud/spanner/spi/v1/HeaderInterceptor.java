@@ -128,6 +128,7 @@ class HeaderInterceptor implements ClientInterceptor {
               new SimpleForwardingClientCallListener<RespT>(responseListener) {
                 @Override
                 public void onHeaders(Metadata metadata) {
+                  recordFirstResponseLatency(requestId, startedAtNanos, firstResponseRecorded);
                   String serverTiming = metadata.get(SERVER_TIMING_HEADER_KEY);
                   try {
                     // Get gfe and afe Latency value
@@ -143,7 +144,6 @@ class HeaderInterceptor implements ClientInterceptor {
 
                 @Override
                 public void onMessage(RespT message) {
-                  recordFirstResponseLatency(requestId, startedAtNanos, firstResponseRecorded);
                   super.onMessage(message);
                 }
 

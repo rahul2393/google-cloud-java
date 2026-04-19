@@ -56,6 +56,9 @@ public class PowerOfTwoReplicaSelector implements ReplicaSelector {
     double s1 = MoreObjects.firstNonNull(score1, Double.MAX_VALUE);
     double s2 = MoreObjects.firstNonNull(score2, Double.MAX_VALUE);
 
-    return s1 <= s2 ? c1 : c2;
+    if (s1 == s2) {
+      return random.nextBoolean() ? c1 : c2;
+    }
+    return s1 < s2 ? c1 : c2;
   }
 }

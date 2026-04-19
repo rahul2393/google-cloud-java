@@ -17,6 +17,7 @@
 package com.google.cloud.spanner.spi.v1;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
@@ -749,7 +750,58 @@ public class KeyRangeCacheTest {
   }
 
   @Test
-  public void preferLeaderFalseBootstrapsUsingUnscoredReplica() {
+  public void preferLeaderFalseUsesInflightCostForColdReplicaSelection() {
+    FakeEndpointCache endpointCache = new FakeEndpointCache();
+    KeyRangeCache cache = new KeyRangeCache(endpointCache);
+    cache.useDeterministicRandom();
+    cache.addRanges(threeReplicaUpdate());
+
+    endpointCache.get("server1");
+    endpointCache.get("server2");
+    endpointCache.get("server3");
+
+    EndpointLatencyRegistry.beginRequest("server1");
+
+    ChannelEndpoint server =
+        cache.fillRoutingHint(
+            false,
+            KeyRangeCache.RangeMode.COVERING_SPLIT,
+            DirectedReadOptions.getDefaultInstance(),
+            RoutingHint.newBuilder().setKey(bytes("a")).setOperationUid(TEST_OPERATION_UID));
+
+    assertNotNull(server);
+    assertEquals("server2", server.getAddress());
+  }
+
+  @Test
+  public void coldReplicaSelectionEmitsFiniteDefaultCost() {
+    FakeEndpointCache endpointCache = new FakeEndpointCache();
+    KeyRangeCache cache = new KeyRangeCache(endpointCache);
+    cache.useDeterministicRandom();
+    cache.addRanges(threeReplicaUpdate());
+
+    endpointCache.get("server1");
+    endpointCache.get("server2");
+    endpointCache.get("server3");
+
+    KeyRangeCache.RouteLookupResult result =
+        cache.lookupRoutingHint(
+            false,
+            KeyRangeCache.RangeMode.COVERING_SPLIT,
+            DirectedReadOptions.getDefaultInstance(),
+            RoutingHint.newBuilder().setKey(bytes("a")).setOperationUid(TEST_OPERATION_UID),
+            address -> false);
+
+    assertNotNull(result.endpoint);
+    assertNotNull(result.selectionDetail);
+    assertEquals("latency_score", result.selectionDetail.selectionReason);
+    assertEquals(10_000.0D, result.selectionDetail.selectedScore, 0.0D);
+    assertTrue(Double.isFinite(result.selectionDetail.scoreGap()));
+    assertEquals(0.0D, result.selectionDetail.scoreGap(), 0.0D);
+  }
+
+  @Test
+  public void preferLeaderFalseInflightCostCanOutweighLowerLatency() {
     FakeEndpointCache endpointCache = new FakeEndpointCache();
     KeyRangeCache cache = new KeyRangeCache(endpointCache);
     cache.useDeterministicRandom();
@@ -760,6 +812,10 @@ public class KeyRangeCacheTest {
     endpointCache.get("server3");
 
     cache.recordReplicaLatency(TEST_OPERATION_UID, "server1", Duration.ofNanos(100_000L));
+    cache.recordReplicaLatency(TEST_OPERATION_UID, "server2", Duration.ofNanos(300_000L));
+    EndpointLatencyRegistry.beginRequest("server1");
+    EndpointLatencyRegistry.beginRequest("server1");
+    EndpointLatencyRegistry.beginRequest("server1");
 
     ChannelEndpoint server =
         cache.fillRoutingHint(

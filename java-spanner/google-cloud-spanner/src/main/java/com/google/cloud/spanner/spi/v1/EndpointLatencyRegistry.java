@@ -20,14 +20,19 @@ import com.google.common.annotations.VisibleForTesting;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /** Shared process-local latency scores for routed Spanner endpoints. */
 final class EndpointLatencyRegistry {
 
   static final Duration DEFAULT_ERROR_PENALTY = Duration.ofSeconds(10);
+  static final Duration DEFAULT_RTT = Duration.ofMillis(10);
+  static final double DEFAULT_PENALTY_VALUE = 1_000_000.0;
 
   private static final String LEADER_SUFFIX = "-LEADER";
   private static final ConcurrentHashMap<TrackerKey, LatencyTracker> TRACKERS =
+      new ConcurrentHashMap<>();
+  private static final ConcurrentHashMap<String, AtomicInteger> INFLIGHT_REQUESTS =
       new ConcurrentHashMap<>();
 
   private EndpointLatencyRegistry() {}
@@ -44,6 +49,22 @@ final class EndpointLatencyRegistry {
     }
     LatencyTracker tracker = TRACKERS.get(trackerKey);
     return tracker == null ? Double.MAX_VALUE : tracker.getScore();
+  }
+
+  static double getSelectionCost(long operationUid, String endpointLabelOrAddress) {
+    TrackerKey trackerKey = trackerKey(operationUid, endpointLabelOrAddress);
+    if (trackerKey == null) {
+      return Double.MAX_VALUE;
+    }
+    double activeRequests = getInflight(endpointLabelOrAddress);
+    LatencyTracker tracker = TRACKERS.get(trackerKey);
+    if (tracker != null) {
+      return tracker.getScore() * (activeRequests + 1.0);
+    }
+    if (activeRequests > 0.0) {
+      return DEFAULT_PENALTY_VALUE + activeRequests;
+    }
+    return defaultRttMicros() * (activeRequests + 1.0);
   }
 
   static void recordLatency(long operationUid, String endpointLabelOrAddress, Duration latency) {
@@ -66,9 +87,42 @@ final class EndpointLatencyRegistry {
     TRACKERS.computeIfAbsent(trackerKey, ignored -> new EwmaLatencyTracker()).recordError(penalty);
   }
 
+  static void beginRequest(String endpointLabelOrAddress) {
+    String address = normalizeAddress(endpointLabelOrAddress);
+    if (address == null) {
+      return;
+    }
+    INFLIGHT_REQUESTS.computeIfAbsent(address, ignored -> new AtomicInteger()).incrementAndGet();
+  }
+
+  static void finishRequest(String endpointLabelOrAddress) {
+    String address = normalizeAddress(endpointLabelOrAddress);
+    if (address == null) {
+      return;
+    }
+    AtomicInteger counter = INFLIGHT_REQUESTS.get(address);
+    if (counter == null) {
+      return;
+    }
+    int updated = counter.decrementAndGet();
+    if (updated <= 0) {
+      INFLIGHT_REQUESTS.remove(address, counter);
+    }
+  }
+
+  static int getInflight(String endpointLabelOrAddress) {
+    String address = normalizeAddress(endpointLabelOrAddress);
+    if (address == null) {
+      return 0;
+    }
+    AtomicInteger counter = INFLIGHT_REQUESTS.get(address);
+    return counter == null ? 0 : Math.max(0, counter.get());
+  }
+
   @VisibleForTesting
   static void clear() {
     TRACKERS.clear();
+    INFLIGHT_REQUESTS.clear();
   }
 
   @VisibleForTesting
@@ -96,6 +150,10 @@ final class EndpointLatencyRegistry {
       return null;
     }
     return new TrackerKey(operationUid, address);
+  }
+
+  private static long defaultRttMicros() {
+    return DEFAULT_RTT.toNanos() / 1_000L;
   }
 
   @VisibleForTesting

@@ -854,6 +854,7 @@ final class KeyAwareChannel extends ManagedChannel {
         selectedTargetEndpointLabel = targetEndpointLabel;
         selectedOperationUid = operationUid;
         this.channelFinder = finder;
+        EndpointLatencyRegistry.beginRequest(targetEndpointLabel);
 
         // Record real traffic for idle eviction tracking.
         parentChannel.onRequestRouted(endpoint);
@@ -1390,15 +1391,15 @@ final class KeyAwareChannel extends ManagedChannel {
 
     @Override
     public void onClose(io.grpc.Status status, Metadata trailers) {
+      String trackedEndpoint =
+          call.selectedTargetEndpointLabel != null
+              ? call.selectedTargetEndpointLabel
+              : (call.selectedEndpoint == null ? null : call.selectedEndpoint.getAddress());
       if (shouldExcludeEndpointOnRetry(status.getCode())) {
-        EndpointLatencyRegistry.recordError(
-            call.selectedOperationUid,
-            call.selectedTargetEndpointLabel != null
-                ? call.selectedTargetEndpointLabel
-                : (call.selectedEndpoint == null ? null : call.selectedEndpoint.getAddress()));
         call.parentChannel.maybeExcludeEndpointOnNextCall(
             call.selectedEndpoint, call.logicalRequestKey);
       }
+      EndpointLatencyRegistry.finishRequest(trackedEndpoint);
       call.maybeClearAffinity();
       super.onClose(status, trailers);
     }

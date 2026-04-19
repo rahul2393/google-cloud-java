@@ -158,7 +158,10 @@ public final class KeyRangeCache {
     }
 
     double scoreGap() {
-      if (!Double.isFinite(selectedScore) || !Double.isFinite(bestEligibleScore)) {
+      if (!Double.isFinite(selectedScore)
+          || !Double.isFinite(bestEligibleScore)
+          || selectedScore == Double.MAX_VALUE
+          || bestEligibleScore == Double.MAX_VALUE) {
         return Double.NaN;
       }
       return selectedScore - bestEligibleScore;
@@ -938,26 +941,14 @@ public final class KeyRangeCache {
                 scoredCandidates);
         return selected;
       }
-      if (scoredCandidates < 2) {
-        TabletSnapshot selected =
-            selectBootstrapTablet(snapshot, eligibleTablets, hintBuilder, operationUid);
-        selectionStats.selectionDetail =
-            buildSelectionDetail(
-                snapshot,
-                eligibleTablets,
-                operationUid,
-                "bootstrap_exploration",
-                selected,
-                scoredCandidates);
-        return selected;
-      }
-
       if (deterministicRandom) {
         TabletSnapshot selected =
             eligibleTablets.stream()
             .min(
                 Comparator.comparingDouble(
-                    tablet -> EndpointLatencyRegistry.getScore(operationUid, tablet.serverAddress)))
+                    tablet ->
+                        EndpointLatencyRegistry.getSelectionCost(
+                            operationUid, tablet.serverAddress)))
             .orElse(eligibleTablets.get(0));
         selectionStats.selectionDetail =
             buildSelectionDetail(
@@ -968,7 +959,8 @@ public final class KeyRangeCache {
       ChannelEndpoint selectedEndpoint =
           replicaSelector.select(
               eligibleEndpoints,
-              endpoint -> EndpointLatencyRegistry.getScore(operationUid, endpoint.getAddress()));
+              endpoint ->
+                  EndpointLatencyRegistry.getSelectionCost(operationUid, endpoint.getAddress()));
       if (selectedEndpoint == null) {
         TabletSnapshot selected = eligibleTablets.get(0);
         selectionStats.selectionDetail =
@@ -976,7 +968,7 @@ public final class KeyRangeCache {
                 snapshot,
                 eligibleTablets,
                 operationUid,
-                "insufficient_scores",
+                "latency_score",
                 selected,
                 scoredCandidates);
         return selected;
@@ -995,31 +987,6 @@ public final class KeyRangeCache {
           buildSelectionDetail(
               snapshot, eligibleTablets, operationUid, "latency_score", selected, scoredCandidates);
       return selected;
-    }
-
-    private TabletSnapshot selectBootstrapTablet(
-        GroupSnapshot snapshot,
-        List<TabletSnapshot> eligibleTablets,
-        RoutingHint.Builder hintBuilder,
-        long operationUid) {
-      List<TabletSnapshot> explorationCandidates = new ArrayList<>();
-      for (TabletSnapshot tablet : eligibleTablets) {
-        if (!EndpointLatencyRegistry.hasScore(operationUid, tablet.serverAddress)) {
-          explorationCandidates.add(tablet);
-        }
-      }
-      List<TabletSnapshot> candidates =
-          explorationCandidates.isEmpty() ? eligibleTablets : explorationCandidates;
-      if (deterministicRandom || candidates.size() == 1) {
-        return candidates.get(0);
-      }
-      int index =
-          uniformRandom(
-              candidates.size(),
-              hintBuilder.getKey(),
-              hintBuilder.getLimitKey(),
-              snapshot.generation);
-      return candidates.get(index);
     }
 
     @javax.annotation.Nullable
@@ -1213,12 +1180,15 @@ public final class KeyRangeCache {
       double bestScore = Double.MAX_VALUE;
       for (TabletSnapshot tablet : eligibleTablets) {
         bestScore =
-            Math.min(bestScore, EndpointLatencyRegistry.getScore(operationUid, tablet.serverAddress));
+            Math.min(
+                bestScore,
+                EndpointLatencyRegistry.getSelectionCost(operationUid, tablet.serverAddress));
       }
 
       StringBuilder alternatives = new StringBuilder();
       int appended = 0;
-      double selectedScore = EndpointLatencyRegistry.getScore(operationUid, selected.serverAddress);
+      double selectedScore =
+          EndpointLatencyRegistry.getSelectionCost(operationUid, selected.serverAddress);
       for (TabletSnapshot tablet : eligibleTablets) {
         if (tablet == selected || appended >= 4) {
           continue;
@@ -1226,7 +1196,8 @@ public final class KeyRangeCache {
         if (alternatives.length() > 0) {
           alternatives.append(", ");
         }
-        double candidateScore = EndpointLatencyRegistry.getScore(operationUid, tablet.serverAddress);
+        double candidateScore =
+            EndpointLatencyRegistry.getSelectionCost(operationUid, tablet.serverAddress);
         alternatives
             .append(endpointLabel(snapshot, tablet))
             .append("=")

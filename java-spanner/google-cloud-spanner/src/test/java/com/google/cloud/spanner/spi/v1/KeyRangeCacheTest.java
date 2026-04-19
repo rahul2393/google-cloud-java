@@ -33,16 +33,24 @@ import io.grpc.ClientCall;
 import io.grpc.ConnectivityState;
 import io.grpc.ManagedChannel;
 import io.grpc.MethodDescriptor;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import javax.annotation.Nullable;
+import org.junit.After;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
 @RunWith(JUnit4.class)
 public class KeyRangeCacheTest {
+  private static final long TEST_OPERATION_UID = 101L;
+
+  @After
+  public void clearLatencyScores() {
+    EndpointLatencyRegistry.clear();
+  }
 
   @Test
   public void skipsTransientFailureTabletWithSkippedTablet() {
@@ -427,7 +435,8 @@ public class KeyRangeCacheTest {
             hint,
             "server1"::equals);
 
-    assertNull(server);
+    assertNotNull(server);
+    assertEquals("server1", server.getAddress());
     assertEquals(0, hint.getSkippedTabletUidCount());
   }
 
@@ -613,6 +622,128 @@ public class KeyRangeCacheTest {
     } finally {
       lifecycleManager.shutdown();
     }
+  }
+
+  @Test
+  public void preferLeaderFalseUsesLowestLatencyReplicaWhenScoresAvailable() {
+    FakeEndpointCache endpointCache = new FakeEndpointCache();
+    KeyRangeCache cache = new KeyRangeCache(endpointCache);
+    cache.useDeterministicRandom();
+    cache.addRanges(threeReplicaUpdate());
+
+    endpointCache.get("server1");
+    endpointCache.get("server2");
+    endpointCache.get("server3");
+
+    cache.recordReplicaLatency(TEST_OPERATION_UID, "server1", Duration.ofNanos(300_000L));
+    cache.recordReplicaLatency(TEST_OPERATION_UID, "server2", Duration.ofNanos(100_000L));
+    cache.recordReplicaLatency(TEST_OPERATION_UID, "server3", Duration.ofNanos(200_000L));
+
+    RoutingHint.Builder hint =
+        RoutingHint.newBuilder().setKey(bytes("a")).setOperationUid(TEST_OPERATION_UID);
+    ChannelEndpoint server =
+        cache.fillRoutingHint(
+            false,
+            KeyRangeCache.RangeMode.COVERING_SPLIT,
+            DirectedReadOptions.getDefaultInstance(),
+            hint);
+
+    assertNotNull(server);
+    assertEquals("server2", server.getAddress());
+  }
+
+  @Test
+  public void preferLeaderTrueIgnoresLatencyScoresForLeaderSelection() {
+    FakeEndpointCache endpointCache = new FakeEndpointCache();
+    KeyRangeCache cache = new KeyRangeCache(endpointCache);
+    cache.useDeterministicRandom();
+    cache.addRanges(threeReplicaUpdate());
+
+    endpointCache.get("server1");
+    endpointCache.get("server2");
+    endpointCache.get("server3");
+
+    cache.recordReplicaLatency(TEST_OPERATION_UID, "server1", Duration.ofNanos(300_000L));
+    cache.recordReplicaLatency(TEST_OPERATION_UID, "server2", Duration.ofNanos(100_000L));
+    cache.recordReplicaLatency(TEST_OPERATION_UID, "server3", Duration.ofNanos(200_000L));
+
+    RoutingHint.Builder hint =
+        RoutingHint.newBuilder().setKey(bytes("a")).setOperationUid(TEST_OPERATION_UID);
+    ChannelEndpoint server =
+        cache.fillRoutingHint(
+            true,
+            KeyRangeCache.RangeMode.COVERING_SPLIT,
+            DirectedReadOptions.getDefaultInstance(),
+            hint);
+
+    assertNotNull(server);
+    assertEquals("server1", server.getAddress());
+  }
+
+  @Test
+  public void preferLeaderFalseSkipsBestScoredReplicaWhenItIsNotReady() {
+    FakeEndpointCache endpointCache = new FakeEndpointCache();
+    KeyRangeCache cache = new KeyRangeCache(endpointCache);
+    cache.useDeterministicRandom();
+    cache.addRanges(threeReplicaUpdate());
+
+    endpointCache.get("server1");
+    endpointCache.get("server2");
+    endpointCache.get("server3");
+    endpointCache.setState("server2", EndpointHealthState.IDLE);
+
+    cache.recordReplicaLatency(TEST_OPERATION_UID, "server1", Duration.ofNanos(300_000L));
+    cache.recordReplicaLatency(TEST_OPERATION_UID, "server2", Duration.ofNanos(100_000L));
+    cache.recordReplicaLatency(TEST_OPERATION_UID, "server3", Duration.ofNanos(200_000L));
+
+    RoutingHint.Builder hint =
+        RoutingHint.newBuilder().setKey(bytes("a")).setOperationUid(TEST_OPERATION_UID);
+    ChannelEndpoint server =
+        cache.fillRoutingHint(
+            false,
+            KeyRangeCache.RangeMode.COVERING_SPLIT,
+            DirectedReadOptions.getDefaultInstance(),
+            hint);
+
+    assertNotNull(server);
+    assertEquals("server3", server.getAddress());
+  }
+
+  @Test
+  public void preferLeaderFalseUsesOperationUidScopedScores() {
+    FakeEndpointCache endpointCache = new FakeEndpointCache();
+    KeyRangeCache cache = new KeyRangeCache(endpointCache);
+    cache.useDeterministicRandom();
+    cache.addRanges(threeReplicaUpdate());
+
+    endpointCache.get("server1");
+    endpointCache.get("server2");
+    endpointCache.get("server3");
+
+    cache.recordReplicaLatency(201L, "server1", Duration.ofNanos(100_000L));
+    cache.recordReplicaLatency(201L, "server2", Duration.ofNanos(300_000L));
+    cache.recordReplicaLatency(201L, "server3", Duration.ofNanos(200_000L));
+    cache.recordReplicaLatency(202L, "server1", Duration.ofNanos(300_000L));
+    cache.recordReplicaLatency(202L, "server2", Duration.ofNanos(100_000L));
+    cache.recordReplicaLatency(202L, "server3", Duration.ofNanos(200_000L));
+
+    ChannelEndpoint firstOperationServer =
+        cache.fillRoutingHint(
+            false,
+            KeyRangeCache.RangeMode.COVERING_SPLIT,
+            DirectedReadOptions.getDefaultInstance(),
+            RoutingHint.newBuilder().setKey(bytes("a")).setOperationUid(201L));
+    ChannelEndpoint secondOperationServer =
+        cache.fillRoutingHint(
+            false,
+            KeyRangeCache.RangeMode.COVERING_SPLIT,
+            DirectedReadOptions.getDefaultInstance(),
+            RoutingHint.newBuilder().setKey(bytes("a")).setOperationUid(202L));
+
+    assertNotNull(firstOperationServer);
+    assertNotNull(secondOperationServer);
+    assertEquals("server1", firstOperationServer.getAddress());
+    assertEquals("server2", secondOperationServer.getAddress());
   }
 
   // --- Eviction and recreation tests ---

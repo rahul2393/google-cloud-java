@@ -639,7 +639,13 @@ public class KeyAwareChannelTest {
     call.start(new CapturingListener<ResultSet>(), new Metadata());
     call.sendMessage(request);
 
-    assertThat(RequestIdTargetTracker.get(requestId.getHeaderValue())).isEqualTo("server-a:1234");
+    RequestIdTargetTracker.RoutingTarget routingTarget =
+        RequestIdTargetTracker.get(requestId.getHeaderValue());
+    assertThat(routingTarget).isNotNull();
+    assertThat(routingTarget.targetEndpoint).isEqualTo("server-a:1234-LEADER");
+    assertThat(EndpointLatencyRegistry.normalizeAddress(routingTarget.targetEndpoint))
+        .isEqualTo("server-a:1234");
+    assertThat(routingTarget.operationUid).isGreaterThan(0L);
     RequestIdTargetTracker.clear();
   }
 

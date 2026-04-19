@@ -42,6 +42,7 @@ import io.opencensus.tags.Tags;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.common.AttributesBuilder;
 import io.opentelemetry.api.trace.Span;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
@@ -152,7 +153,13 @@ class HeaderInterceptor implements ClientInterceptor {
                     LOGGER.log(
                         LEVEL, "Unable to get built-in metric attributes {}", e.getMessage());
                   }
-                  String resolvedTargetEndpoint = RequestIdTargetTracker.get(requestId);
+                  RequestIdTargetTracker.RoutingTarget routingTarget =
+                      RequestIdTargetTracker.get(requestId);
+                  String resolvedTargetEndpoint =
+                      routingTarget == null ? null : routingTarget.targetEndpoint;
+                  recordReplicaLatency(
+                      routingTarget == null ? 0L : routingTarget.operationUid,
+                      resolvedTargetEndpoint);
                   recordBuiltInMetrics(
                       compositeTracer,
                       builtInMetricsAttributes,
@@ -226,6 +233,16 @@ class HeaderInterceptor implements ClientInterceptor {
       compositeTracer.recordServerTimingHeaderMetrics(
           gfeLatency, afeLatency, isDirectPathUsed, isAfeEnabled);
     }
+  }
+
+  private void recordReplicaLatency(long operationUid, String targetEndpoint) {
+    Float latencyMillis = afeLatency != null ? afeLatency : gfeLatency;
+    if (operationUid <= 0 || targetEndpoint == null || latencyMillis == null) {
+      return;
+    }
+    long latencyNanos = Math.max(0L, (long) (latencyMillis * 1_000_000d));
+    EndpointLatencyRegistry.recordLatency(
+        operationUid, targetEndpoint, Duration.ofNanos(latencyNanos));
   }
 
   private Map<String, Float> parseServerTimingHeader(String serverTiming) {

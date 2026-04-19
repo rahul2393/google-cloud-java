@@ -37,6 +37,7 @@ import com.google.spanner.v1.PartialResultSet;
 import com.google.spanner.v1.ReadRequest;
 import com.google.spanner.v1.ResultSet;
 import com.google.spanner.v1.RollbackRequest;
+import com.google.spanner.v1.RoutingHint;
 import com.google.spanner.v1.Transaction;
 import com.google.spanner.v1.TransactionSelector;
 import io.grpc.CallOptions;
@@ -503,7 +504,8 @@ final class KeyAwareChannel extends ManagedChannel {
       String target,
       boolean usedDefaultEndpoint,
       boolean hasChannelFinder,
-      long routeSelectionNanos) {
+      long routeSelectionNanos,
+      @Nullable KeyRangeCache.SelectionDetail selectionDetail) {
     Span span = Span.current();
     if (!span.getSpanContext().isValid()) {
       return;
@@ -514,15 +516,54 @@ final class KeyAwareChannel extends ManagedChannel {
     span.setAttribute("spanner.route.has_channel_finder", hasChannelFinder);
     span.setAttribute("spanner.route.method", methodDescriptor.getFullMethodName());
     span.setAttribute("spanner.route.selection_ms", routeSelectionMs);
-    span.addEvent(
-        "spanner.route.selected",
+    if (selectionDetail != null) {
+      span.setAttribute("spanner.route.selection_reason", selectionDetail.selectionReason);
+      if (selectionDetail.operationUid > 0) {
+        span.setAttribute("spanner.route.operation_uid", selectionDetail.operationUid);
+      }
+      span.setAttribute(
+          "spanner.route.eligible_candidate_count", selectionDetail.eligibleCandidateCount);
+      span.setAttribute("spanner.route.scored_candidate_count", selectionDetail.scoredCandidateCount);
+      if (Double.isFinite(selectionDetail.selectedScore)
+          && selectionDetail.selectedScore != Double.MAX_VALUE) {
+        span.setAttribute("spanner.route.selected_score", selectionDetail.selectedScore);
+      }
+      if (Double.isFinite(selectionDetail.bestEligibleScore)
+          && selectionDetail.bestEligibleScore != Double.MAX_VALUE) {
+        span.setAttribute("spanner.route.best_eligible_score", selectionDetail.bestEligibleScore);
+      }
+      if (!selectionDetail.alternativesSummary.isEmpty()) {
+        span.setAttribute("spanner.route.alternatives", selectionDetail.alternativesSummary);
+      }
+    }
+    AttributesBuilder eventAttributes =
         Attributes.builder()
             .put("spanner.target", target)
             .put("spanner.route.used_default_endpoint", usedDefaultEndpoint)
             .put("spanner.route.has_channel_finder", hasChannelFinder)
             .put("spanner.route.method", methodDescriptor.getFullMethodName())
-            .put("spanner.route.selection_ms", routeSelectionMs)
-            .build());
+            .put("spanner.route.selection_ms", routeSelectionMs);
+    if (selectionDetail != null) {
+      eventAttributes.put("spanner.route.selection_reason", selectionDetail.selectionReason);
+      if (selectionDetail.operationUid > 0) {
+        eventAttributes.put("spanner.route.operation_uid", selectionDetail.operationUid);
+      }
+      eventAttributes.put(
+          "spanner.route.eligible_candidate_count", selectionDetail.eligibleCandidateCount);
+      eventAttributes.put("spanner.route.scored_candidate_count", selectionDetail.scoredCandidateCount);
+      if (Double.isFinite(selectionDetail.selectedScore)
+          && selectionDetail.selectedScore != Double.MAX_VALUE) {
+        eventAttributes.put("spanner.route.selected_score", selectionDetail.selectedScore);
+      }
+      if (Double.isFinite(selectionDetail.bestEligibleScore)
+          && selectionDetail.bestEligibleScore != Double.MAX_VALUE) {
+        eventAttributes.put("spanner.route.best_eligible_score", selectionDetail.bestEligibleScore);
+      }
+      if (!selectionDetail.alternativesSummary.isEmpty()) {
+        eventAttributes.put("spanner.route.alternatives", selectionDetail.alternativesSummary);
+      }
+    }
+    span.addEvent("spanner.route.selected", eventAttributes.build());
   }
 
   private static double nanosToMillis(long nanos) {
@@ -581,6 +622,7 @@ final class KeyAwareChannel extends ManagedChannel {
     @Nullable private Predicate<String> excludedEndpoints;
     @Nullable private ChannelEndpoint selectedEndpoint;
     @Nullable private String selectedTargetEndpointLabel;
+    private long selectedOperationUid;
     @Nullable private ByteString transactionIdToClear;
     private boolean allowDefaultAffinity;
     private long pendingRequests;
@@ -651,6 +693,8 @@ final class KeyAwareChannel extends ManagedChannel {
         String routingDecisionLabel = "default_host";
         String routingReasonLabel = "unknown";
         String targetEndpointLabel = null;
+        KeyRangeCache.SelectionDetail selectionDetail = null;
+        long operationUid = 0L;
         List<KeyRangeCache.SkippedTabletDetail> routingSkippedTabletDetails =
             Collections.emptyList();
 
@@ -663,6 +707,8 @@ final class KeyAwareChannel extends ManagedChannel {
           routingDecisionLabel = routing.decision;
           routingReasonLabel = routing.reason;
           targetEndpointLabel = routing.targetEndpointLabel;
+          selectionDetail = routing.selectionDetail;
+          operationUid = routing.operationUid;
           routingSkippedTabletDetails = routing.skippedTabletDetails;
           message = (RequestT) reqBuilder.build();
         } else if (message instanceof ExecuteSqlRequest) {
@@ -674,6 +720,8 @@ final class KeyAwareChannel extends ManagedChannel {
           routingDecisionLabel = routing.decision;
           routingReasonLabel = routing.reason;
           targetEndpointLabel = routing.targetEndpointLabel;
+          selectionDetail = routing.selectionDetail;
+          operationUid = routing.operationUid;
           routingSkippedTabletDetails = routing.skippedTabletDetails;
           message = (RequestT) reqBuilder.build();
         } else if (message instanceof BeginTransactionRequest) {
@@ -691,6 +739,7 @@ final class KeyAwareChannel extends ManagedChannel {
               routingDecisionLabel = "routed_replica";
               routingReasonLabel = "selected";
               targetEndpointLabel = routeLookup.targetEndpointLabel;
+              selectionDetail = routeLookup.selectionDetail;
             } else {
               routingReasonLabel = routeFailureReasonLabel(routeLookup.failureReason);
             }
@@ -723,6 +772,7 @@ final class KeyAwareChannel extends ManagedChannel {
               routingDecisionLabel = "routed_replica";
               routingReasonLabel = "selected";
               targetEndpointLabel = routeLookup.targetEndpointLabel;
+              selectionDetail = routeLookup.selectionDetail;
             } else {
               routingReasonLabel = routeFailureReasonLabel(routeLookup.failureReason);
             }
@@ -781,13 +831,14 @@ final class KeyAwareChannel extends ManagedChannel {
         if (!parentChannel.defaultEndpointAddress.equals(endpoint.getAddress())) {
           LocationAwareTelemetry.recordRoutingDecision(
               routingDecisionLabel, routingReasonLabel, targetEndpointLabel,
-              methodDescriptor.getFullMethodName());
+              methodDescriptor.getFullMethodName(), selectionDetail);
         } else {
           LocationAwareTelemetry.recordRoutingDecision(
               "default_host",
               routingReasonLabel,
               targetEndpointLabel,
-              methodDescriptor.getFullMethodName());
+              methodDescriptor.getFullMethodName(),
+              selectionDetail);
         }
         for (KeyRangeCache.SkippedTabletDetail skippedTabletDetail : routingSkippedTabletDetails) {
           LocationAwareTelemetry.recordRoutingSkippedTablet(
@@ -801,6 +852,7 @@ final class KeyAwareChannel extends ManagedChannel {
         }
         selectedEndpoint = endpoint;
         selectedTargetEndpointLabel = targetEndpointLabel;
+        selectedOperationUid = operationUid;
         this.channelFinder = finder;
 
         // Record real traffic for idle eviction tracking.
@@ -808,7 +860,7 @@ final class KeyAwareChannel extends ManagedChannel {
 
         XGoogSpannerRequestId requestId = callOptions.getOption(REQUEST_ID_CALL_OPTIONS_KEY);
         if (requestId != null) {
-          RequestIdTargetTracker.record(requestId.getHeaderValue(), targetEndpointLabel);
+          RequestIdTargetTracker.record(requestId.getHeaderValue(), targetEndpointLabel, operationUid);
         }
         ApiTracer tracer = callOptions.getOption(TRACER_KEY);
         if (tracer instanceof CompositeTracer) {
@@ -822,7 +874,8 @@ final class KeyAwareChannel extends ManagedChannel {
             endpoint.getAddress(),
             parentChannel.defaultEndpointAddress.equals(endpoint.getAddress()),
             finder != null,
-            routeSelectionCompletedAtNanos - routeSelectionStartedAtNanos);
+            routeSelectionCompletedAtNanos - routeSelectionStartedAtNanos,
+            selectionDetail);
         CallOptions effectiveCallOptions = callOptions;
         if (isStreamingMethod(methodDescriptor)) {
           effectiveCallOptions =
@@ -998,11 +1051,20 @@ final class KeyAwareChannel extends ManagedChannel {
             endpoint.getAddress(),
             "affinity",
             "selected",
+            operationUid(reqBuilder.getRoutingHint()),
+            null,
             Collections.emptyList());
       }
       if (databaseId == null) {
         return new RoutingDecision(
-            null, null, null, decision, "missing_database_id", Collections.emptyList());
+            null,
+            null,
+            null,
+            decision,
+            "missing_database_id",
+            operationUid(reqBuilder.getRoutingHint()),
+            null,
+            Collections.emptyList());
       }
       if (databaseId != null) {
         finder = parentChannel.getOrCreateChannelFinder(databaseId);
@@ -1024,6 +1086,8 @@ final class KeyAwareChannel extends ManagedChannel {
               routed.targetEndpointLabel,
               decision,
               reason,
+              operationUid(reqBuilder.getRoutingHint()),
+              routed.selectionDetail,
               routed.skippedTabletDetails);
         } else {
           reason = routeFailureReasonLabel(routed.failureReason);
@@ -1035,6 +1099,8 @@ final class KeyAwareChannel extends ManagedChannel {
           null,
           decision,
           reason,
+          operationUid(reqBuilder.getRoutingHint()),
+          routed == null ? null : routed.selectionDetail,
           routed == null ? Collections.emptyList() : routed.skippedTabletDetails);
     }
 
@@ -1056,11 +1122,20 @@ final class KeyAwareChannel extends ManagedChannel {
             endpoint.getAddress(),
             "affinity",
             "selected",
+            operationUid(reqBuilder.getRoutingHint()),
+            null,
             Collections.emptyList());
       }
       if (databaseId == null) {
         return new RoutingDecision(
-            null, null, null, decision, "missing_database_id", Collections.emptyList());
+            null,
+            null,
+            null,
+            decision,
+            "missing_database_id",
+            operationUid(reqBuilder.getRoutingHint()),
+            null,
+            Collections.emptyList());
       }
       if (databaseId != null) {
         finder = parentChannel.getOrCreateChannelFinder(databaseId);
@@ -1082,6 +1157,8 @@ final class KeyAwareChannel extends ManagedChannel {
               routed.targetEndpointLabel,
               decision,
               reason,
+              operationUid(reqBuilder.getRoutingHint()),
+              routed.selectionDetail,
               routed.skippedTabletDetails);
         } else {
           reason = routeFailureReasonLabel(routed.failureReason);
@@ -1093,6 +1170,8 @@ final class KeyAwareChannel extends ManagedChannel {
           null,
           decision,
           reason,
+          operationUid(reqBuilder.getRoutingHint()),
+          routed == null ? null : routed.selectionDetail,
           routed == null ? Collections.emptyList() : routed.skippedTabletDetails);
     }
 
@@ -1114,6 +1193,8 @@ final class KeyAwareChannel extends ManagedChannel {
     @Nullable private final String targetEndpointLabel;
     private final String decision;
     private final String reason;
+    private final long operationUid;
+    @Nullable private final KeyRangeCache.SelectionDetail selectionDetail;
     private final List<KeyRangeCache.SkippedTabletDetail> skippedTabletDetails;
 
     private RoutingDecision(
@@ -1122,14 +1203,22 @@ final class KeyAwareChannel extends ManagedChannel {
         @Nullable String targetEndpointLabel,
         String decision,
         String reason,
+        long operationUid,
+        @Nullable KeyRangeCache.SelectionDetail selectionDetail,
         List<KeyRangeCache.SkippedTabletDetail> skippedTabletDetails) {
       this.finder = finder;
       this.endpoint = endpoint;
       this.targetEndpointLabel = targetEndpointLabel;
       this.decision = decision;
       this.reason = reason;
+      this.operationUid = operationUid;
+      this.selectionDetail = selectionDetail;
       this.skippedTabletDetails = skippedTabletDetails;
     }
+  }
+
+  private static long operationUid(RoutingHint routingHint) {
+    return routingHint == null ? 0L : routingHint.getOperationUid();
   }
 
   private static final class LocationAwareClientStreamTracerFactory
@@ -1302,6 +1391,11 @@ final class KeyAwareChannel extends ManagedChannel {
     @Override
     public void onClose(io.grpc.Status status, Metadata trailers) {
       if (shouldExcludeEndpointOnRetry(status.getCode())) {
+        EndpointLatencyRegistry.recordError(
+            call.selectedOperationUid,
+            call.selectedTargetEndpointLabel != null
+                ? call.selectedTargetEndpointLabel
+                : (call.selectedEndpoint == null ? null : call.selectedEndpoint.getAddress()));
         call.parentChannel.maybeExcludeEndpointOnNextCall(
             call.selectedEndpoint, call.logicalRequestKey);
       }

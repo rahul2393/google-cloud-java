@@ -24,7 +24,7 @@ import javax.annotation.Nullable;
 
 final class RequestIdTargetTracker {
 
-  private static final Cache<String, String> TARGETS =
+  private static final Cache<String, RoutingTarget> TARGETS =
       CacheBuilder.newBuilder()
           .maximumSize(100_000L)
           .expireAfterWrite(10, TimeUnit.MINUTES)
@@ -32,18 +32,18 @@ final class RequestIdTargetTracker {
 
   private RequestIdTargetTracker() {}
 
-  static void record(String requestId, String targetEndpoint) {
+  static void record(String requestId, String targetEndpoint, long operationUid) {
     if (requestId == null
         || requestId.isEmpty()
         || targetEndpoint == null
         || targetEndpoint.isEmpty()) {
       return;
     }
-    TARGETS.put(requestId, targetEndpoint);
+    TARGETS.put(requestId, new RoutingTarget(targetEndpoint, operationUid));
   }
 
   @Nullable
-  static String get(String requestId) {
+  static RoutingTarget get(String requestId) {
     if (requestId == null || requestId.isEmpty()) {
       return null;
     }
@@ -60,5 +60,15 @@ final class RequestIdTargetTracker {
   @VisibleForTesting
   static void clear() {
     TARGETS.invalidateAll();
+  }
+
+  static final class RoutingTarget {
+    final String targetEndpoint;
+    final long operationUid;
+
+    private RoutingTarget(String targetEndpoint, long operationUid) {
+      this.targetEndpoint = targetEndpoint;
+      this.operationUid = operationUid;
+    }
   }
 }

@@ -22,6 +22,7 @@ import io.opentelemetry.api.GlobalOpenTelemetry;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.metrics.DoubleHistogram;
+import io.opentelemetry.api.metrics.LongHistogram;
 import io.opentelemetry.api.metrics.LongCounter;
 import io.opentelemetry.api.metrics.Meter;
 import io.opentelemetry.api.metrics.ObservableLongGauge;
@@ -43,6 +44,9 @@ final class LocationAwareTelemetry {
       AttributeKey.stringKey("skipped_target_endpoint");
   private static final AttributeKey<String> REASON_KEY = AttributeKey.stringKey("reason");
   private static final AttributeKey<String> DECISION_KEY = AttributeKey.stringKey("decision");
+  private static final AttributeKey<String> SELECTION_REASON_KEY =
+      AttributeKey.stringKey("selection_reason");
+  private static final AttributeKey<Long> OPERATION_UID_KEY = AttributeKey.longKey("operation_uid");
   private static final Set<EndpointStateProvider> PROVIDERS = ConcurrentHashMap.newKeySet();
   private static volatile TelemetryState telemetryState =
       new TelemetryState(GlobalOpenTelemetry.get());
@@ -116,17 +120,48 @@ final class LocationAwareTelemetry {
   }
 
   static void recordRoutingDecision(
-      String decision, String reason, @Nullable String targetEndpoint, @Nullable String method) {
+      String decision,
+      String reason,
+      @Nullable String targetEndpoint,
+      @Nullable String method,
+      @Nullable KeyRangeCache.SelectionDetail selectionDetail) {
     io.opentelemetry.api.common.AttributesBuilder attributesBuilder = Attributes.builder();
     attributesBuilder.put(DECISION_KEY, decision == null ? "unknown" : decision);
     attributesBuilder.put(REASON_KEY, reason == null ? "unknown" : reason);
+    if (selectionDetail != null) {
+      attributesBuilder.put(SELECTION_REASON_KEY, selectionDetail.selectionReason);
+      if (selectionDetail.operationUid > 0) {
+        attributesBuilder.put(OPERATION_UID_KEY, selectionDetail.operationUid);
+      }
+    }
     if (method != null && !method.isEmpty()) {
       attributesBuilder.put(METHOD_KEY, method);
     }
     if (targetEndpoint != null && !targetEndpoint.isEmpty()) {
       attributesBuilder.put(TARGET_ENDPOINT_KEY, targetEndpoint);
     }
-    telemetry().routingDecisionCounter.add(1L, attributesBuilder.build());
+    Attributes attributes = attributesBuilder.build();
+    telemetry().routingDecisionCounter.add(1L, attributes);
+    if (selectionDetail != null) {
+      telemetry()
+          .routingEligibleCandidateCount
+          .record((long) selectionDetail.eligibleCandidateCount, attributes);
+      telemetry()
+          .routingScoredCandidateCount
+          .record((long) selectionDetail.scoredCandidateCount, attributes);
+      if (Double.isFinite(selectionDetail.selectedScore)
+          && selectionDetail.selectedScore != Double.MAX_VALUE) {
+        telemetry().routingSelectedScore.record(selectionDetail.selectedScore, attributes);
+      }
+      if (Double.isFinite(selectionDetail.bestEligibleScore)
+          && selectionDetail.bestEligibleScore != Double.MAX_VALUE) {
+        telemetry().routingBestEligibleScore.record(selectionDetail.bestEligibleScore, attributes);
+      }
+      double scoreGap = selectionDetail.scoreGap();
+      if (Double.isFinite(scoreGap)) {
+        telemetry().routingScoreGap.record(scoreGap, attributes);
+      }
+    }
   }
 
   static void recordRoutingSkippedTablet(
@@ -208,6 +243,11 @@ final class LocationAwareTelemetry {
     final LongCounter endpointSkipCounter;
     final LongCounter routingDecisionCounter;
     final LongCounter routingSkippedTabletCounter;
+    final DoubleHistogram routingSelectedScore;
+    final DoubleHistogram routingBestEligibleScore;
+    final DoubleHistogram routingScoreGap;
+    final LongHistogram routingEligibleCandidateCount;
+    final LongHistogram routingScoredCandidateCount;
     final ObservableLongGauge endpointStateGauge;
     final ObservableLongGauge endpointStateCountGauge;
 
@@ -255,6 +295,33 @@ final class LocationAwareTelemetry {
           meter.counterBuilder("location_aware.routing_skipped_tablet_count")
               .setDescription(
                   "Skipped tablet reasons attached to a final location-aware routing decision.")
+              .setUnit("1")
+              .build();
+      this.routingSelectedScore =
+          meter.histogramBuilder("location_aware.routing_selected_score")
+              .setDescription("Latency score of the final selected routed endpoint.")
+              .setUnit("us")
+              .build();
+      this.routingBestEligibleScore =
+          meter.histogramBuilder("location_aware.routing_best_eligible_score")
+              .setDescription("Best latency score among eligible routed endpoint candidates.")
+              .setUnit("us")
+              .build();
+      this.routingScoreGap =
+          meter.histogramBuilder("location_aware.routing_score_gap")
+              .setDescription("Difference between selected and best eligible routed endpoint score.")
+              .setUnit("us")
+              .build();
+      this.routingEligibleCandidateCount =
+          meter.histogramBuilder("location_aware.routing_eligible_candidate_count")
+              .ofLongs()
+              .setDescription("Eligible routed endpoint candidate count before final selection.")
+              .setUnit("1")
+              .build();
+      this.routingScoredCandidateCount =
+          meter.histogramBuilder("location_aware.routing_scored_candidate_count")
+              .ofLongs()
+              .setDescription("Eligible routed endpoint candidate count with a known latency score.")
               .setUnit("1")
               .build();
       this.endpointStateGauge =

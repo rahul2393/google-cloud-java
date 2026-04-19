@@ -26,6 +26,7 @@ import com.google.spanner.v1.Group;
 import com.google.spanner.v1.Range;
 import com.google.spanner.v1.RoutingHint;
 import com.google.spanner.v1.Tablet;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -80,27 +81,32 @@ public final class KeyRangeCache {
     @javax.annotation.Nullable final String targetEndpointLabel;
     final List<SkippedTabletDetail> skippedTabletDetails;
     final RouteFailureReason failureReason;
+    @javax.annotation.Nullable final SelectionDetail selectionDetail;
 
     private RouteLookupResult(
         @javax.annotation.Nullable ChannelEndpoint endpoint,
         @javax.annotation.Nullable String targetEndpointLabel,
         List<SkippedTabletDetail> skippedTabletDetails,
-        RouteFailureReason failureReason) {
+        RouteFailureReason failureReason,
+        @javax.annotation.Nullable SelectionDetail selectionDetail) {
       this.endpoint = endpoint;
       this.targetEndpointLabel = targetEndpointLabel;
       this.skippedTabletDetails = skippedTabletDetails;
       this.failureReason = failureReason;
+      this.selectionDetail = selectionDetail;
     }
 
     static RouteLookupResult routed(
         ChannelEndpoint endpoint,
         String targetEndpointLabel,
-        List<SkippedTabletDetail> skippedTabletDetails) {
+        List<SkippedTabletDetail> skippedTabletDetails,
+        @javax.annotation.Nullable SelectionDetail selectionDetail) {
       return new RouteLookupResult(
           endpoint,
           targetEndpointLabel,
           Collections.unmodifiableList(new ArrayList<>(skippedTabletDetails)),
-          RouteFailureReason.NONE);
+          RouteFailureReason.NONE,
+          selectionDetail);
     }
 
     static RouteLookupResult failed(
@@ -109,7 +115,8 @@ public final class KeyRangeCache {
           null,
           null,
           Collections.unmodifiableList(new ArrayList<>(skippedTabletDetails)),
-          failureReason);
+          failureReason,
+          null);
     }
   }
 
@@ -121,6 +128,40 @@ public final class KeyRangeCache {
         @javax.annotation.Nullable String targetEndpointLabel, String reason) {
       this.targetEndpointLabel = targetEndpointLabel;
       this.reason = reason;
+    }
+  }
+
+  static final class SelectionDetail {
+    final String selectionReason;
+    final long operationUid;
+    final int eligibleCandidateCount;
+    final int scoredCandidateCount;
+    final double selectedScore;
+    final double bestEligibleScore;
+    final String alternativesSummary;
+
+    private SelectionDetail(
+        String selectionReason,
+        long operationUid,
+        int eligibleCandidateCount,
+        int scoredCandidateCount,
+        double selectedScore,
+        double bestEligibleScore,
+        String alternativesSummary) {
+      this.selectionReason = selectionReason;
+      this.operationUid = operationUid;
+      this.eligibleCandidateCount = eligibleCandidateCount;
+      this.scoredCandidateCount = scoredCandidateCount;
+      this.selectedScore = selectedScore;
+      this.bestEligibleScore = bestEligibleScore;
+      this.alternativesSummary = alternativesSummary;
+    }
+
+    double scoreGap() {
+      if (!Double.isFinite(selectedScore) || !Double.isFinite(bestEligibleScore)) {
+        return Double.NaN;
+      }
+      return selectedScore - bestEligibleScore;
     }
   }
 
@@ -140,6 +181,7 @@ public final class KeyRangeCache {
   private final Lock readLock = cacheLock.readLock();
   private final Lock writeLock = cacheLock.writeLock();
   private final AtomicLong accessCounter = new AtomicLong();
+  private final ReplicaSelector replicaSelector = new PowerOfTwoReplicaSelector();
 
   private volatile boolean deterministicRandom = false;
   private volatile int minCacheEntriesForRandomPick = DEFAULT_MIN_ENTRIES_FOR_RANDOM_PICK;
@@ -163,6 +205,16 @@ public final class KeyRangeCache {
   @VisibleForTesting
   void setMinCacheEntriesForRandomPick(int value) {
     minCacheEntriesForRandomPick = value;
+  }
+
+  @VisibleForTesting
+  void recordReplicaLatency(long operationUid, String address, Duration latency) {
+    EndpointLatencyRegistry.recordLatency(operationUid, address, latency);
+  }
+
+  @VisibleForTesting
+  void recordReplicaError(long operationUid, String address) {
+    EndpointLatencyRegistry.recordError(operationUid, address);
   }
 
   /** Applies cache updates. Tablets are processed inside group updates. */
@@ -739,7 +791,8 @@ public final class KeyRangeCache {
             return RouteLookupResult.routed(
                 resolveEndpoint(selected, resolvedEndpoints),
                 endpointLabel(snapshot, selected),
-                skippedTabletDetails);
+                skippedTabletDetails,
+                selectionStats.selectionDetail);
           }
         }
         return RouteLookupResult.failed(failureReason, skippedTabletDetails);
@@ -757,7 +810,8 @@ public final class KeyRangeCache {
       return RouteLookupResult.routed(
           resolveEndpoint(selected, resolvedEndpoints),
           endpointLabel(snapshot, selected),
-          skippedTabletDetails);
+          skippedTabletDetails,
+          selectionStats.selectionDetail);
     }
 
     private TabletSnapshot selectTablet(
@@ -771,6 +825,18 @@ public final class KeyRangeCache {
         List<SkippedTabletDetail> skippedTabletDetails,
         Map<String, ChannelEndpoint> resolvedEndpoints,
         SelectionStats selectionStats) {
+      if (!preferLeader) {
+        return selectLatencyAwareTablet(
+            snapshot,
+            directedReadOptions,
+            hintBuilder,
+            excludedEndpoints,
+            skippedTabletUids,
+            skippedTabletDetails,
+            resolvedEndpoints,
+            selectionStats);
+      }
+
       boolean checkedLeader = false;
       if (preferLeader
           && !hasDirectedReadOptions
@@ -813,6 +879,109 @@ public final class KeyRangeCache {
         return tablet;
       }
       return null;
+    }
+
+    private TabletSnapshot selectLatencyAwareTablet(
+        GroupSnapshot snapshot,
+        DirectedReadOptions directedReadOptions,
+        RoutingHint.Builder hintBuilder,
+        Predicate<String> excludedEndpoints,
+        Set<Long> skippedTabletUids,
+        List<SkippedTabletDetail> skippedTabletDetails,
+        Map<String, ChannelEndpoint> resolvedEndpoints,
+        SelectionStats selectionStats) {
+      long operationUid = hintBuilder.getOperationUid();
+      List<TabletSnapshot> eligibleTablets = new ArrayList<>();
+      List<ChannelEndpoint> eligibleEndpoints = new ArrayList<>();
+      int scoredCandidates = 0;
+
+      for (TabletSnapshot tablet : snapshot.tablets) {
+        if (!tablet.matches(directedReadOptions)) {
+          continue;
+        }
+        selectionStats.matchingReplicas++;
+        if (shouldSkip(
+            snapshot,
+            tablet,
+            hintBuilder,
+            excludedEndpoints,
+            skippedTabletUids,
+            skippedTabletDetails,
+            resolvedEndpoints,
+            selectionStats)) {
+          continue;
+        }
+
+        ChannelEndpoint endpoint = resolveEndpoint(tablet, resolvedEndpoints);
+        if (endpoint == null) {
+          continue;
+        }
+        eligibleTablets.add(tablet);
+        eligibleEndpoints.add(endpoint);
+        if (EndpointLatencyRegistry.hasScore(operationUid, tablet.serverAddress)) {
+          scoredCandidates++;
+        }
+      }
+
+      if (eligibleTablets.isEmpty()) {
+        return null;
+      }
+      if (eligibleTablets.size() == 1 || scoredCandidates < 2) {
+        TabletSnapshot selected = eligibleTablets.get(0);
+        selectionStats.selectionDetail =
+            buildSelectionDetail(
+                snapshot,
+                eligibleTablets,
+                operationUid,
+                "insufficient_scores",
+                selected,
+                scoredCandidates);
+        return selected;
+      }
+
+      if (deterministicRandom) {
+        TabletSnapshot selected =
+            eligibleTablets.stream()
+            .min(
+                Comparator.comparingDouble(
+                    tablet -> EndpointLatencyRegistry.getScore(operationUid, tablet.serverAddress)))
+            .orElse(eligibleTablets.get(0));
+        selectionStats.selectionDetail =
+            buildSelectionDetail(
+                snapshot, eligibleTablets, operationUid, "latency_score", selected, scoredCandidates);
+        return selected;
+      }
+
+      ChannelEndpoint selectedEndpoint =
+          replicaSelector.select(
+              eligibleEndpoints,
+              endpoint -> EndpointLatencyRegistry.getScore(operationUid, endpoint.getAddress()));
+      if (selectedEndpoint == null) {
+        TabletSnapshot selected = eligibleTablets.get(0);
+        selectionStats.selectionDetail =
+            buildSelectionDetail(
+                snapshot,
+                eligibleTablets,
+                operationUid,
+                "insufficient_scores",
+                selected,
+                scoredCandidates);
+        return selected;
+      }
+      for (int i = 0; i < eligibleTablets.size(); i++) {
+        if (eligibleEndpoints.get(i) == selectedEndpoint) {
+          TabletSnapshot selected = eligibleTablets.get(i);
+          selectionStats.selectionDetail =
+              buildSelectionDetail(
+                  snapshot, eligibleTablets, operationUid, "latency_score", selected, scoredCandidates);
+          return selected;
+        }
+      }
+      TabletSnapshot selected = eligibleTablets.get(0);
+      selectionStats.selectionDetail =
+          buildSelectionDetail(
+              snapshot, eligibleTablets, operationUid, "latency_score", selected, scoredCandidates);
+      return selected;
     }
 
     @javax.annotation.Nullable
@@ -977,6 +1146,7 @@ public final class KeyRangeCache {
       private int missingEndpointCount;
       private int tabletMarkedSkipCount;
       private int missingAddressCount;
+      @javax.annotation.Nullable private SelectionDetail selectionDetail;
 
       private RouteFailureReason toFailureReason() {
         if (matchingReplicas == 0) {
@@ -993,6 +1163,69 @@ public final class KeyRangeCache {
         }
         return RouteFailureReason.NO_ROUTABLE_REPLICA;
       }
+    }
+
+    private SelectionDetail buildSelectionDetail(
+        GroupSnapshot snapshot,
+        List<TabletSnapshot> eligibleTablets,
+        long operationUid,
+        String selectionReason,
+        TabletSnapshot selected,
+        int scoredCandidates) {
+      double bestScore = Double.MAX_VALUE;
+      for (TabletSnapshot tablet : eligibleTablets) {
+        bestScore =
+            Math.min(bestScore, EndpointLatencyRegistry.getScore(operationUid, tablet.serverAddress));
+      }
+
+      StringBuilder alternatives = new StringBuilder();
+      int appended = 0;
+      double selectedScore = EndpointLatencyRegistry.getScore(operationUid, selected.serverAddress);
+      for (TabletSnapshot tablet : eligibleTablets) {
+        if (tablet == selected || appended >= 4) {
+          continue;
+        }
+        if (alternatives.length() > 0) {
+          alternatives.append(", ");
+        }
+        double candidateScore = EndpointLatencyRegistry.getScore(operationUid, tablet.serverAddress);
+        alternatives
+            .append(endpointLabel(snapshot, tablet))
+            .append("=")
+            .append(formatScore(candidateScore))
+            .append(":")
+            .append(alternativeReason(candidateScore, selectedScore));
+        appended++;
+      }
+
+      return new SelectionDetail(
+          selectionReason,
+          operationUid,
+          eligibleTablets.size(),
+          scoredCandidates,
+          selectedScore,
+          bestScore,
+          alternatives.toString());
+    }
+
+    private String alternativeReason(double candidateScore, double selectedScore) {
+      if (!Double.isFinite(candidateScore) || candidateScore == Double.MAX_VALUE) {
+        return "unscored";
+      }
+      if (candidateScore < selectedScore) {
+        return "not_sampled_by_policy";
+      }
+      if (candidateScore > selectedScore) {
+        return "higher_score";
+      }
+      return "tie_not_selected";
+    }
+
+    private String formatScore(double score) {
+      if (!Double.isFinite(score) || score == Double.MAX_VALUE) {
+        return "unknown";
+      }
+      return Long.toString(Math.round(score));
     }
 
     private void recordKnownTransientFailure(

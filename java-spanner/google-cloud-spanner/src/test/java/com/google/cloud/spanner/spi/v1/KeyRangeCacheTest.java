@@ -570,6 +570,7 @@ public class KeyRangeCacheTest {
   public void laterTransientFailureReplicaReportedWhenEarlierReplicaSelected() {
     FakeEndpointCache endpointCache = new FakeEndpointCache();
     KeyRangeCache cache = new KeyRangeCache(endpointCache);
+    cache.useDeterministicRandom();
     cache.addRanges(threeReplicaUpdate());
 
     endpointCache.get("server1");
@@ -601,6 +602,7 @@ public class KeyRangeCacheTest {
         new RecentTransientFailureLifecycleManager(endpointCache);
     try {
       KeyRangeCache cache = new KeyRangeCache(endpointCache, lifecycleManager);
+      cache.useDeterministicRandom();
       cache.addRanges(threeReplicaUpdate());
 
       endpointCache.get("server1");
@@ -744,6 +746,30 @@ public class KeyRangeCacheTest {
     assertNotNull(secondOperationServer);
     assertEquals("server1", firstOperationServer.getAddress());
     assertEquals("server2", secondOperationServer.getAddress());
+  }
+
+  @Test
+  public void preferLeaderFalseBootstrapsUsingUnscoredReplica() {
+    FakeEndpointCache endpointCache = new FakeEndpointCache();
+    KeyRangeCache cache = new KeyRangeCache(endpointCache);
+    cache.useDeterministicRandom();
+    cache.addRanges(threeReplicaUpdate());
+
+    endpointCache.get("server1");
+    endpointCache.get("server2");
+    endpointCache.get("server3");
+
+    cache.recordReplicaLatency(TEST_OPERATION_UID, "server1", Duration.ofNanos(100_000L));
+
+    ChannelEndpoint server =
+        cache.fillRoutingHint(
+            false,
+            KeyRangeCache.RangeMode.COVERING_SPLIT,
+            DirectedReadOptions.getDefaultInstance(),
+            RoutingHint.newBuilder().setKey(bytes("a")).setOperationUid(TEST_OPERATION_UID));
+
+    assertNotNull(server);
+    assertEquals("server2", server.getAddress());
   }
 
   // --- Eviction and recreation tests ---

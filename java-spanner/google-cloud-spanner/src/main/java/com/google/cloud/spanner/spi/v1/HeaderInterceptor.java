@@ -46,6 +46,7 @@ import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
@@ -105,6 +106,8 @@ class HeaderInterceptor implements ClientInterceptor {
       public void start(Listener<RespT> responseListener, Metadata headers) {
         try {
           Span span = Span.current();
+          long startedAtNanos = System.nanoTime();
+          AtomicBoolean firstResponseRecorded = new AtomicBoolean(false);
           DatabaseName databaseName = extractDatabaseName(headers);
           String key = extractKey(databaseName, method.getFullMethodName());
           String requestId = extractRequestId(headers);
@@ -139,6 +142,12 @@ class HeaderInterceptor implements ClientInterceptor {
                 }
 
                 @Override
+                public void onMessage(RespT message) {
+                  recordFirstResponseLatency(requestId, startedAtNanos, firstResponseRecorded);
+                  super.onMessage(message);
+                }
+
+                @Override
                 public void onClose(Status status, Metadata trailers) {
                   // Record Built-in Metrics
                   boolean isDirectPathUsed = AltsContextUtil.check(getAttributes());
@@ -157,9 +166,9 @@ class HeaderInterceptor implements ClientInterceptor {
                       RequestIdTargetTracker.get(requestId);
                   String resolvedTargetEndpoint =
                       routingTarget == null ? null : routingTarget.targetEndpoint;
-                  recordReplicaLatency(
-                      routingTarget == null ? 0L : routingTarget.operationUid,
-                      resolvedTargetEndpoint);
+                  if (status.isOk()) {
+                    recordFirstResponseLatency(requestId, startedAtNanos, firstResponseRecorded);
+                  }
                   recordBuiltInMetrics(
                       compositeTracer,
                       builtInMetricsAttributes,
@@ -235,14 +244,21 @@ class HeaderInterceptor implements ClientInterceptor {
     }
   }
 
-  private void recordReplicaLatency(long operationUid, String targetEndpoint) {
-    Float latencyMillis = afeLatency != null ? afeLatency : gfeLatency;
-    if (operationUid <= 0 || targetEndpoint == null || latencyMillis == null) {
+  private void recordFirstResponseLatency(
+      String requestId, long startedAtNanos, AtomicBoolean firstResponseRecorded) {
+    if (firstResponseRecorded == null || !firstResponseRecorded.compareAndSet(false, true)) {
       return;
     }
-    long latencyNanos = Math.max(0L, (long) (latencyMillis * 1_000_000d));
+    RequestIdTargetTracker.RoutingTarget routingTarget = RequestIdTargetTracker.get(requestId);
+    if (routingTarget == null
+        || routingTarget.operationUid <= 0
+        || routingTarget.targetEndpoint == null
+        || routingTarget.targetEndpoint.isEmpty()) {
+      return;
+    }
+    long latencyNanos = Math.max(0L, System.nanoTime() - startedAtNanos);
     EndpointLatencyRegistry.recordLatency(
-        operationUid, targetEndpoint, Duration.ofNanos(latencyNanos));
+        routingTarget.operationUid, routingTarget.targetEndpoint, Duration.ofNanos(latencyNanos));
   }
 
   private Map<String, Float> parseServerTimingHeader(String serverTiming) {

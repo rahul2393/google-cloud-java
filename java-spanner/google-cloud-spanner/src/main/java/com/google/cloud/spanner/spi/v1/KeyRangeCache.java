@@ -926,14 +926,27 @@ public final class KeyRangeCache {
       if (eligibleTablets.isEmpty()) {
         return null;
       }
-      if (eligibleTablets.size() == 1 || scoredCandidates < 2) {
+      if (eligibleTablets.size() == 1) {
         TabletSnapshot selected = eligibleTablets.get(0);
         selectionStats.selectionDetail =
             buildSelectionDetail(
                 snapshot,
                 eligibleTablets,
                 operationUid,
-                "insufficient_scores",
+                "single_candidate",
+                selected,
+                scoredCandidates);
+        return selected;
+      }
+      if (scoredCandidates < 2) {
+        TabletSnapshot selected =
+            selectBootstrapTablet(snapshot, eligibleTablets, hintBuilder, operationUid);
+        selectionStats.selectionDetail =
+            buildSelectionDetail(
+                snapshot,
+                eligibleTablets,
+                operationUid,
+                "bootstrap_exploration",
                 selected,
                 scoredCandidates);
         return selected;
@@ -982,6 +995,31 @@ public final class KeyRangeCache {
           buildSelectionDetail(
               snapshot, eligibleTablets, operationUid, "latency_score", selected, scoredCandidates);
       return selected;
+    }
+
+    private TabletSnapshot selectBootstrapTablet(
+        GroupSnapshot snapshot,
+        List<TabletSnapshot> eligibleTablets,
+        RoutingHint.Builder hintBuilder,
+        long operationUid) {
+      List<TabletSnapshot> explorationCandidates = new ArrayList<>();
+      for (TabletSnapshot tablet : eligibleTablets) {
+        if (!EndpointLatencyRegistry.hasScore(operationUid, tablet.serverAddress)) {
+          explorationCandidates.add(tablet);
+        }
+      }
+      List<TabletSnapshot> candidates =
+          explorationCandidates.isEmpty() ? eligibleTablets : explorationCandidates;
+      if (deterministicRandom || candidates.size() == 1) {
+        return candidates.get(0);
+      }
+      int index =
+          uniformRandom(
+              candidates.size(),
+              hintBuilder.getKey(),
+              hintBuilder.getLimitKey(),
+              snapshot.generation);
+      return candidates.get(index);
     }
 
     @javax.annotation.Nullable

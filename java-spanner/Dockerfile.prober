@@ -90,8 +90,8 @@ RUN mvn -f /workspace/java-spanner/bypass-performance/pom.xml package \
 
 RUN JAR_PATH="$(find /workspace/java-spanner/bypass-performance/target -maxdepth 1 -type f -name 'google-cloud-spanner-bypass-performance-*.jar' ! -name '*-tests.jar' ! -name 'original-*' | head -n 1)" \
  && test -n "$JAR_PATH" \
- && cp "$JAR_PATH" /workspace/main.jar \
- && file /workspace/main.jar
+ && cp "$JAR_PATH" /workspace/java-spanner/bypass-performance/target/main.jar \
+ && file /workspace/java-spanner/bypass-performance/target/main.jar
 
 FROM eclipse-temurin:17-jdk AS runtime-release
 
@@ -110,5 +110,5 @@ USER root
 RUN apt-get update \
  && apt-get install -y --no-install-recommends procps \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=local-build /workspace/main.jar /app/main.jar
+COPY --from=local-build /workspace/java-spanner/bypass-performance/target/main.jar /app/main.jar
 ENTRYPOINT ["java", "-jar", "/app/main.jar"]

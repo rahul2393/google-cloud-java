@@ -33,8 +33,9 @@ import io.opentelemetry.sdk.trace.samplers.Sampler;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetAddress;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.concurrent.Executors;
@@ -295,7 +296,8 @@ final class Main {
 
   private static long readLongFile(String path) {
     try {
-      return Long.parseLong(Files.readString(Path.of(path)).trim());
+      return Long.parseLong(
+          new String(Files.readAllBytes(Paths.get(path)), StandardCharsets.UTF_8).trim());
     } catch (Exception e) {
       return -1L;
     }

@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: spanner-ns
+  name: irahul-stale-query-directpath
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: irahul-stale-query-directpath
+  template:
+    metadata:
+      labels:
+        app: irahul-stale-query-directpath
+    spec:
+      containers:
+        - name: stale-query-directpath
+          image: us-central1-docker.pkg.dev/span-cloud-testing/irahul-images/irahul-client:6.117.0
+          imagePullPolicy: Always
+          command: ["java"]
+          args:
+            - -XX:-TieredCompilation
+            - -XX:CompileThreshold=1000
+            - -jar
+            - /app/main.jar
+          resources:
+            requests:
+              memory: "400Mi"
+              cpu: "0.4"
+            limits:
+              memory: "400Mi"
+              cpu: "0.4"
+          env:
+            - name: PROBE_TYPE
+              value: "stale_query"
+            - name: QPS
+              value: "10"
+            - name: OTEL_SERVICE_NAME
+              value: "irahul-stale-query-directpath"
+            - name: GOOGLE_SPANNER_ENABLE_DIRECT_ACCESS
+              value: "true"

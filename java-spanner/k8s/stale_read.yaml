@@ -17,6 +17,13 @@ spec:
         - name: stale-query
           image: us-central1-docker.pkg.dev/span-cloud-testing/irahul-images/irahul-client:latest
           imagePullPolicy: Always
+          ports:
+            - name: jmx
+              containerPort: 5000
+              protocol: TCP
+            - name: jdwp
+              containerPort: 5005
+              protocol: TCP
           command: ["java"]
           args:
             - -XX:-TieredCompilation
@@ -37,3 +44,6 @@ spec:
               value: "10"
             - name: OTEL_SERVICE_NAME
               value: "irahul-stale-query"
+#            - name: JAVA_TOOL_OPTIONS
+#              value: "-XX:+AlwaysPreTouch -XX:+UseG1GC -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005 -Dcom.sun.management.jmxremote=true -Dcom.sun.management.jmxremote.port=5000 -Dcom.sun.management.jmxremote.rmi.port=5000 -Dcom.sun.management.jmxremote.local.only=false -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Djava.rmi.server.hostname=127.0.0.1"
+

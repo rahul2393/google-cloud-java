@@ -33,6 +33,8 @@ import io.opentelemetry.sdk.trace.samplers.Sampler;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetAddress;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.concurrent.Executors;
@@ -145,6 +147,7 @@ final class Main {
     System.out.println("YCSB zero padding: " + ycsbZeroPadding);
     System.out.println("Service name: " + serviceName);
     System.out.println("------------------------------------------------------------------------");
+    registerMemoryMetrics();
 
     String host = endpoint;
     if (!host.isEmpty() && !host.startsWith("http")) {
@@ -267,6 +270,35 @@ final class Main {
             0,
             periodMicros,
             MICROSECONDS);
+  }
+
+  private static void registerMemoryMetrics() {
+    meter
+        .gaugeBuilder("container_memory_bytes")
+        .ofLongs()
+        .setDescription("Current cgroup memory usage for the container")
+        .setUnit("By")
+        .buildWithCallback(measurement -> measurement.record(readContainerMemoryBytes()));
+  }
+
+  private static long readContainerMemoryBytes() {
+    long cgroupV2 = readLongFile("/sys/fs/cgroup/memory.current");
+    if (cgroupV2 >= 0) {
+      return cgroupV2;
+    }
+    long cgroupV1 = readLongFile("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+    if (cgroupV1 >= 0) {
+      return cgroupV1;
+    }
+    return -1L;
+  }
+
+  private static long readLongFile(String path) {
+    try {
+      return Long.parseLong(Files.readString(Path.of(path)).trim());
+    } catch (Exception e) {
+      return -1L;
+    }
   }
 
   public static OpenTelemetrySdk initializeOpenTelemetry() {
